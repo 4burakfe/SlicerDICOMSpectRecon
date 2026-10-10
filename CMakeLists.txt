@@ -4,12 +4,12 @@ project(DICOMSpectRecon)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/DICOMSpectRecon")
+set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/SlicerDICOMSpectRecon")
 set(EXTENSION_CATEGORY "Nuclear Medicine")
 set(EXTENSION_CONTRIBUTORS "Burak Demir")
 set(EXTENSION_DESCRIPTION "SPECT reconstruction from NM tomographic projections in the DICOM browser: OSEM with CT attenuation and energy-window scatter correction (PyTomography), gated studies, interactive preview, and Bq/ml and SUV quantification with camera calibration.")
-set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/DICOMSpectRecon/main/DICOMSpectRecon/Resources/Icons/DICOMSpectRecon.png")
-set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/4burakfe/DICOMSpectRecon/main/screenshot.jpg https://raw.githubusercontent.com/4burakfe/DICOMSpectRecon/main/screenshot2.jpg")
+set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/SlicerDICOMSpectRecon/main/DICOMSpectRecon/Resources/Icons/DICOMSpectRecon.png")
+set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/4burakfe/SlicerDICOMSpectRecon/main/screenshot.jpg https://raw.githubusercontent.com/4burakfe/SlicerDICOMSpectRecon/main/screenshot2.jpg")
 set(EXTENSION_DEPENDS PyTorch)
 
 #-----------------------------------------------------------------------------
