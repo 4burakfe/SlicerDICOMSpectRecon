@@ -4,6 +4,8 @@ Reconstructs SPECT studies straight from the raw NM tomographic projections in S
 The projection series (ImageType TOMO or GATED TOMO) shows up as a loadable, and Load opens a
 reconstruction window with a live preview before anything is added to the scene.
 
+Author: Burak Demir, MD, FEBNM
+
 > **Built on [PyTomography](https://github.com/qurit/PyTomography).** The reconstruction engine of this
 > extension - the SPECT system model, attenuation and scatter modelling, and OSEM - is PyTomography,
 > developed by the [Quantitative Radiomolecular Imaging and Therapy (Qurit) lab](https://www.qurit.ca/).
