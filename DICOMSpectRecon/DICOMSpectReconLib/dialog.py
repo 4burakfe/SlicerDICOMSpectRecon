@@ -432,7 +432,7 @@ class SpectReconDialog:
         self.filterCombo = qt.QComboBox()
         self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
-        self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 5.0, " mm", FWHM_TOOLTIP)
+        self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 10.0, " mm", FWHM_TOOLTIP)
         self.cutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.45, " x Nyq",
                                   "Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
                                   "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
@@ -463,7 +463,7 @@ class SpectReconDialog:
             self.gatedFilterCombo = qt.QComboBox()
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
-            self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 7.0, " mm", FWHM_TOOLTIP)
+            self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
             self.gatedCutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.35, " x Nyq",
                                            "Gates hold fewer counts than the static image, so a lower cutoff is usual")
             self.gatedOrderSpin = _slider(1, 20, 1, 0, 10)
