@@ -316,7 +316,7 @@ class SPECTCalibrationWidget(ScriptedLoadableModuleWidget):
             values = [record.get("name", ""), str(record.get("created", ""))[:16].replace("T", " "),
                       record.get("isotope", ""), record.get("collimator", ""),
                       f"{camera.get('model', '')} {camera.get('serial', '')}".strip(),
-                      record.get("scatter", {}).get("method", "None"),
+                      quant.scatterLabel(record),
                       f"{float(record.get('cpsPerMBq', 0)):.4f}",
                       str(detectors) if detectors else "?"]
             for column, value in enumerate(values):
@@ -347,7 +347,10 @@ class SPECTCalibrationWidget(ScriptedLoadableModuleWidget):
                                     "DICOM SPECT plugin.</span>")
             return
         ac = attributes.get("AttenuationCorrection", "None")
-        parts = [f"AC: {ac}", f"SC: {attributes.get('ScatterMethod', attributes.get('ScatterCorrection', '?'))}",
+        scatterText = attributes.get('ScatterMethod', attributes.get('ScatterCorrection', '?'))
+        if attributes.get("ScatterMethod") == "DEW":
+            scatterText += f" (weight {attributes.get('ScatterWeight') or 'auto'})"
+        parts = [f"AC: {ac}", f"SC: {scatterText}",
                  f"{attributes.get('Isotope') or 'isotope ?'}", f"{attributes.get('Collimator') or 'collimator ?'}",
                  f"{attributes.get('CameraModel', '')} {attributes.get('CameraSerial', '')}".strip(),
                  f"{attributes.get('Detectors', '?')} detector(s)", f"units: {attributes.get('Units', 'counts')}"]

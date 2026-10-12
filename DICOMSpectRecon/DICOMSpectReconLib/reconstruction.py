@@ -72,7 +72,13 @@ class ProjectionSet:
         except Exception:
             return int(self.projections.shape[0])
 
-    def scatterEstimate(self, indexPeak, indexLower, indexUpper):
+    def scatterEstimate(self, indexPeak, indexLower, indexUpper, weight=None):
+        """weight None: PyTomography's width-normalised estimate. weight k (dual window only):
+        k x lower window counts, the convention of vendor DEW settings (e.g. GE "scatter weight")."""
+        if weight is not None:
+            if indexUpper is not None:
+                raise ValueError("A manual scatter weight is only used with dual energy window correction.")
+            return self.allProjections[indexLower] * float(weight)
         from pytomography.io.SPECT import dicom as spect_dicom
         return spect_dicom.get_energy_window_scatter_estimate_projections(
             self.fileNM, self.allProjections, indexPeak, indexLower, indexUpper)
@@ -233,7 +239,8 @@ class SpectReconLogic:
     def reconstruct(self, iters, subsets, useAttenuationCorrection=False,
                     scatter=None, projectionSet=None):
         """OSEM reconstruction in PyTomography's native units (counts per voxel per view).
-        scatter: None, or (indexLower, indexUpper) with indexUpper possibly None (dual window).
+        scatter: None, or (indexLower, indexUpper[, weight]) with indexUpper possibly None (dual
+        window) and weight None (automatic) or a manual dual window scatter weight.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
         import torch
         import SimpleITK as sitk
@@ -260,12 +267,13 @@ class SpectReconLogic:
             additive_term = None
             scatterCounts = 0.0
             if scatter is not None:
-                indexLower, indexUpper = scatter
+                indexLower, indexUpper, weight = (tuple(scatter) + (None,))[:3]
                 if indexLower is None:
                     raise ValueError("Scatter correction needs a lower energy window.")
                 method = "dual" if indexUpper is None else "triple"
-                self.log(f"Estimating scatter ({method} energy window) for {projectionSet.label}...")
-                additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper)
+                weightNote = "" if weight is None else f", weight {float(weight):g} x lower window"
+                self.log(f"Estimating scatter ({method} energy window{weightNote}) for {projectionSet.label}...")
+                additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper, weight)
                 if not bool(torch.isfinite(additive_term).all()):
                     raise ValueError("The scatter estimate contains invalid values - check the energy windows.")
                 scatterCounts = float(additive_term.sum().item())
@@ -418,8 +426,19 @@ def scatterDescription(params):
     if lower is not None and upper is not None:
         return f"Triple energy window (lower {lower + 1}, upper {upper + 1})"
     if lower is not None:
-        return f"Dual energy window (lower {lower + 1})"
+        weight = params.get("scatterWeight")
+        weightText = "auto" if weight is None else f"{float(weight):g}"
+        return f"Dual energy window (lower {lower + 1}, weight {weightText})"
     return "None (upper-only window is not supported)"
+
+
+def autoScatterWeight(peakWidth, lowerWidth):
+    """Scatter weight k (scatter = k x lower window counts) that PyTomography's automatic dual
+    window estimate amounts to: the triple window formula with an empty upper window,
+    0.5 x photopeak width / lower window width."""
+    if not peakWidth or not lowerWidth or lowerWidth <= 0:
+        return None
+    return 0.5 * float(peakWidth) / float(lowerWidth)
 
 
 def filterDescription(params):

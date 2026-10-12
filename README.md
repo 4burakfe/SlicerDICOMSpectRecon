@@ -25,6 +25,8 @@ Author: Burak Demir, MD, FEBNM
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
 - **Scatter correction** with dual or triple energy windows, chosen from the acquisition's windows.
+  The dual window weight is automatic (0.5 x photopeak width / lower window width) or can be set
+  by hand, e.g. 1.1 to match GE Xeleris' "Scatter weight for Tc99m".
 - **Gated studies**: gated reconstruction in cine plus the summed static image; gates are loaded as a
   sequence.
 - **Post-filters** (Butterworth, Gaussian, ...) and output count scaling.
