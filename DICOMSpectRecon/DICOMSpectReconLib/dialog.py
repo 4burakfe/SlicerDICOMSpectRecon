@@ -412,26 +412,28 @@ class SpectReconDialog:
 
         filterGroup, filterForm = _group("Post-filter - static" if self.isGated else "Post-filter")
         self.filterCombo = qt.QComboBox()
-        self.filterCombo.addItems(["None", "Gaussian", "Butterworth"])
+        self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
-        self.sigmaSpin = qt.QDoubleSpinBox()
-        self.sigmaSpin.setRange(0.1, 50.0)
-        self.sigmaSpin.setSingleStep(0.5)
-        self.sigmaSpin.setValue(2.0)
-        self.sigmaSpin.setSuffix(" mm")
-        self.sigmaSpin.setToolTip("Gaussian sigma")
+        self.fwhmSpin = qt.QDoubleSpinBox()
+        self.fwhmSpin.setRange(0.5, 100.0)
+        self.fwhmSpin.setSingleStep(0.5)
+        self.fwhmSpin.setValue(5.0)
+        self.fwhmSpin.setSuffix(" mm")
+        self.fwhmSpin.setToolTip("Gaussian full width at half maximum (FWHM = 2.355 x sigma)")
         self.cutoffSpin = qt.QDoubleSpinBox()
         self.cutoffSpin.setRange(0.05, 1.0)
         self.cutoffSpin.setSingleStep(0.05)
         self.cutoffSpin.setDecimals(2)
         self.cutoffSpin.setValue(0.45)
         self.cutoffSpin.setSuffix(" x Nyq")
-        self.cutoffSpin.setToolTip("Conventional SPECT: 0.4-0.5 x Nyquist; lower (~0.2-0.3) for low-count studies")
+        self.cutoffSpin.setToolTip("Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
+                                   "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
+                                   "smooths more than Butterworth at the same value.")
         self.orderSpin = qt.QSpinBox()
         self.orderSpin.setRange(1, 20)
         self.orderSpin.setValue(10)
         self.orderSpin.setToolTip("Conventional SPECT: order 5-10")
-        for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("Sigma:", self.sigmaSpin),
+        for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("FWHM:", self.fwhmSpin),
                                                ("Cutoff:", self.cutoffSpin), ("Order:", self.orderSpin)]):
             filterForm.addWidget(qt.QLabel(label), row, 0)
             filterForm.addWidget(widget, row, 1)
@@ -454,14 +456,14 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
             self.gatedFilterCombo = qt.QComboBox()
-            self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth"])
+            self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
-            self.gatedSigmaSpin = qt.QDoubleSpinBox()
-            self.gatedSigmaSpin.setRange(0.1, 50.0)
-            self.gatedSigmaSpin.setSingleStep(0.5)
-            self.gatedSigmaSpin.setValue(3.0)
-            self.gatedSigmaSpin.setSuffix(" mm")
-            self.gatedSigmaSpin.setToolTip("Gaussian sigma")
+            self.gatedFwhmSpin = qt.QDoubleSpinBox()
+            self.gatedFwhmSpin.setRange(0.5, 100.0)
+            self.gatedFwhmSpin.setSingleStep(0.5)
+            self.gatedFwhmSpin.setValue(7.0)
+            self.gatedFwhmSpin.setSuffix(" mm")
+            self.gatedFwhmSpin.setToolTip("Gaussian full width at half maximum (FWHM = 2.355 x sigma)")
             self.gatedCutoffSpin = qt.QDoubleSpinBox()
             self.gatedCutoffSpin.setRange(0.05, 1.0)
             self.gatedCutoffSpin.setSingleStep(0.05)
@@ -474,7 +476,7 @@ class SpectReconDialog:
             self.gatedOrderSpin.setValue(10)
             gatedForm.addWidget(self.gatedEnableCheckBox, 0, 0, 1, 2)
             left = [("Iterations:", self.gatedItersSpin), ("Subsets:", self.gatedSubsetsSpin)]
-            right = [("Filter:", self.gatedFilterCombo), ("Sigma:", self.gatedSigmaSpin),
+            right = [("Filter:", self.gatedFilterCombo), ("FWHM:", self.gatedFwhmSpin),
                      ("Cutoff:", self.gatedCutoffSpin), ("Order:", self.gatedOrderSpin)]
             for row, (label, widget) in enumerate(left):
                 gatedForm.addWidget(qt.QLabel(label), row + 1, 0)
@@ -1264,14 +1266,14 @@ class SpectReconDialog:
 
     def onFilterChanged(self, index):
         name = self.filterCombo.currentText
-        self.sigmaSpin.setEnabled(name == "Gaussian")
-        self.cutoffSpin.setEnabled(name == "Butterworth")
+        self.fwhmSpin.setEnabled(name == "Gaussian")
+        self.cutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.orderSpin.setEnabled(name == "Butterworth")
 
     def onGatedFilterChanged(self, index):
         name = self.gatedFilterCombo.currentText
-        self.gatedSigmaSpin.setEnabled(name == "Gaussian")
-        self.gatedCutoffSpin.setEnabled(name == "Butterworth")
+        self.gatedFwhmSpin.setEnabled(name == "Gaussian")
+        self.gatedCutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.gatedOrderSpin.setEnabled(name == "Butterworth")
 
     def log(self, message):
@@ -1288,7 +1290,7 @@ class SpectReconDialog:
             "attenuationCorrection": bool(self.acCheckBox.checked) and bool(self.ctFiles),
             "ctId": (self.ctFiles[0], len(self.ctFiles)) if self.ctFiles else None,
             "filter": self.filterCombo.currentText,
-            "sigma": self.sigmaSpin.value,
+            "fwhm": self.fwhmSpin.value,
             "cutoff": self.cutoffSpin.value,
             "order": self.orderSpin.value,
             "scaling": self.scalingCombo.currentText,
@@ -1311,7 +1313,7 @@ class SpectReconDialog:
                 "gatedIters": self.gatedItersSpin.value,
                 "gatedSubsets": self.gatedSubsetsSpin.value,
                 "gatedFilter": self.gatedFilterCombo.currentText,
-                "gatedSigma": self.gatedSigmaSpin.value,
+                "gatedFwhm": self.gatedFwhmSpin.value,
                 "gatedCutoff": self.gatedCutoffSpin.value,
                 "gatedOrder": self.gatedOrderSpin.value,
             })
@@ -1353,8 +1355,8 @@ class SpectReconDialog:
     @staticmethod
     def filterParams(params, gated=False):
         if not gated:
-            return {k: params[k] for k in ("filter", "sigma", "cutoff", "order")}
-        return {"filter": params["gatedFilter"], "sigma": params["gatedSigma"],
+            return {k: params[k] for k in ("filter", "fwhm", "cutoff", "order")}
+        return {"filter": params["gatedFilter"], "fwhm": params["gatedFwhm"],
                 "cutoff": params["gatedCutoff"], "order": params["gatedOrder"]}
 
     def _setBusy(self, busy):
@@ -1662,7 +1664,7 @@ class SpectReconDialog:
 
     def _watchSettings(self):
         """Re-check the Load state whenever any setting in the side panel changes."""
-        watched = [self.itersSpin, self.subsetsSpin, self.filterCombo, self.sigmaSpin, self.cutoffSpin,
+        watched = [self.itersSpin, self.subsetsSpin, self.filterCombo, self.fwhmSpin, self.cutoffSpin,
                    self.orderSpin, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
                    self.peakCombo, self.lowerCombo, self.upperCombo, self.scatterWeightSpin,
                    self.quantGroup, self.calibrationCombo,
@@ -1671,7 +1673,7 @@ class SpectReconDialog:
                    self.weightSpin, self.heightSpin, self.sexCombo]
         if self.isGated:
             watched += [self.gatedEnableCheckBox, self.gatedItersSpin, self.gatedSubsetsSpin,
-                        self.gatedFilterCombo, self.gatedSigmaSpin, self.gatedCutoffSpin, self.gatedOrderSpin]
+                        self.gatedFilterCombo, self.gatedFwhmSpin, self.gatedCutoffSpin, self.gatedOrderSpin]
         for widget in watched:
             if isinstance(widget, qt.QDateTimeEdit):
                 signal = "dateTimeChanged(QDateTime)"
