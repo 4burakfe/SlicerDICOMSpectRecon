@@ -72,7 +72,13 @@ class ProjectionSet:
         except Exception:
             return int(self.projections.shape[0])
 
-    def scatterEstimate(self, indexPeak, indexLower, indexUpper):
+    def scatterEstimate(self, indexPeak, indexLower, indexUpper, weight=None):
+        """weight None: PyTomography's width-normalised estimate. weight k (dual window only):
+        k x lower window counts, the convention of vendor DEW settings (e.g. GE "scatter weight")."""
+        if weight is not None:
+            if indexUpper is not None:
+                raise ValueError("A manual scatter weight is only used with dual energy window correction.")
+            return self.allProjections[indexLower] * float(weight)
         from pytomography.io.SPECT import dicom as spect_dicom
         return spect_dicom.get_energy_window_scatter_estimate_projections(
             self.fileNM, self.allProjections, indexPeak, indexLower, indexUpper)
@@ -233,7 +239,8 @@ class SpectReconLogic:
     def reconstruct(self, iters, subsets, useAttenuationCorrection=False,
                     scatter=None, projectionSet=None):
         """OSEM reconstruction in PyTomography's native units (counts per voxel per view).
-        scatter: None, or (indexLower, indexUpper) with indexUpper possibly None (dual window).
+        scatter: None, or (indexLower, indexUpper[, weight]) with indexUpper possibly None (dual
+        window) and weight None (automatic) or a manual dual window scatter weight.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
         import torch
         import SimpleITK as sitk
@@ -260,12 +267,13 @@ class SpectReconLogic:
             additive_term = None
             scatterCounts = 0.0
             if scatter is not None:
-                indexLower, indexUpper = scatter
+                indexLower, indexUpper, weight = (tuple(scatter) + (None,))[:3]
                 if indexLower is None:
                     raise ValueError("Scatter correction needs a lower energy window.")
                 method = "dual" if indexUpper is None else "triple"
-                self.log(f"Estimating scatter ({method} energy window) for {projectionSet.label}...")
-                additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper)
+                weightNote = "" if weight is None else f", weight {float(weight):g} x lower window"
+                self.log(f"Estimating scatter ({method} energy window{weightNote}) for {projectionSet.label}...")
+                additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper, weight)
                 if not bool(torch.isfinite(additive_term).all()):
                     raise ValueError("The scatter estimate contains invalid values - check the energy windows.")
                 scatterCounts = float(additive_term.sum().item())
@@ -372,11 +380,14 @@ def scaleCounts(image, stats, mode):
     return (image * float(factor) if factor != 1.0 else image), factor, note
 
 
-def butterworth3D(image, cutoff, order):
-    """3D Butterworth low-pass: H(f) = 1 / (1 + (f/fc)^(2n)), f and fc as fraction of the
-    in-plane Nyquist frequency. Frequencies are physical (cycles/mm), so the filter is
-    isotropic even when the slice spacing differs from the pixel size.
-    H(0) = 1, so total counts are preserved (apart from clipping ringing negatives to 0)."""
+FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.355
+
+
+def _frequencyFilter3D(image, response):
+    """Apply a radial low-pass response H(f) in 3D, f as a fraction of the in-plane Nyquist
+    frequency. Frequencies are physical (cycles/mm), so the filter is isotropic even when the
+    slice spacing differs from the pixel size. H(0) = 1, so total counts are preserved
+    (apart from clipping ringing negatives to 0)."""
     import SimpleITK as sitk
     arr = sitk.GetArrayFromImage(image).astype(np.float64)  # [z, y, x]
     nz, ny, nx = arr.shape
@@ -386,27 +397,47 @@ def butterworth3D(image, cutoff, order):
     fy = np.fft.fftfreq(ny, d=sy) / nyquist
     fx = np.fft.rfftfreq(nx, d=sx) / nyquist
     f = np.sqrt(fz[:, None, None] ** 2 + fy[None, :, None] ** 2 + fx[None, None, :] ** 2)
-    with np.errstate(over="ignore"):
-        H = 1.0 / (1.0 + (f / cutoff) ** (2 * order))
-    out = np.fft.irfftn(np.fft.rfftn(arr) * H, s=arr.shape, axes=(0, 1, 2))
+    out = np.fft.irfftn(np.fft.rfftn(arr) * response(f), s=arr.shape, axes=(0, 1, 2))
     out = np.clip(out, 0, None).astype(np.float32)
     result = sitk.GetImageFromArray(out)
     result.CopyInformation(image)
     return result
 
 
+def butterworth3D(image, cutoff, order):
+    """3D Butterworth low-pass: H(f) = 1 / (1 + (f/fc)^(2n))."""
+    def response(f):
+        with np.errstate(over="ignore"):
+            return 1.0 / (1.0 + (f / cutoff) ** (2 * order))
+    return _frequencyFilter3D(image, response)
+
+
+def hann3D(image, cutoff):
+    """3D Hann low-pass: H(f) = 0.5 x (1 + cos(pi f/fc)) below the cutoff, 0 above it."""
+    def response(f):
+        return np.where(f < cutoff, 0.5 * (1.0 + np.cos(np.pi * np.minimum(f / cutoff, 1.0))), 0.0)
+    return _frequencyFilter3D(image, response)
+
+
+def _cyclesPerCm(image, cutoff):
+    return cutoff * 10.0 / (2.0 * image.GetSpacing()[0])
+
+
 def applyFilter(image, params, log):
     import SimpleITK as sitk
     name = params["filter"]
     if name == "Gaussian":
-        log(f"Applying Gaussian Filter (Sigma: {params['sigma']} mm)...")
-        return sitk.SmoothingRecursiveGaussian(image, params["sigma"])
+        sigma = params["fwhm"] / FWHM_PER_SIGMA
+        log(f"Applying Gaussian Filter (FWHM: {params['fwhm']:g} mm, sigma {sigma:.2f} mm)...")
+        return sitk.SmoothingRecursiveGaussian(image, sigma)
     if name == "Butterworth":
-        sx = image.GetSpacing()[0]
-        cyclesPerCm = params["cutoff"] * 10.0 / (2.0 * sx)
         log(f"Applying Butterworth Filter (cutoff: {params['cutoff']:.2f} x Nyquist "
-            f"= {cyclesPerCm:.2f} cycles/cm in-plane, order: {params['order']})...")
+            f"= {_cyclesPerCm(image, params['cutoff']):.2f} cycles/cm in-plane, order: {params['order']})...")
         return butterworth3D(image, params["cutoff"], params["order"])
+    if name == "Hann":
+        log(f"Applying Hann Filter (cutoff: {params['cutoff']:.2f} x Nyquist "
+            f"= {_cyclesPerCm(image, params['cutoff']):.2f} cycles/cm in-plane)...")
+        return hann3D(image, params["cutoff"])
     log("No post-filter applied.")
     return image
 
@@ -418,13 +449,26 @@ def scatterDescription(params):
     if lower is not None and upper is not None:
         return f"Triple energy window (lower {lower + 1}, upper {upper + 1})"
     if lower is not None:
-        return f"Dual energy window (lower {lower + 1})"
+        weight = params.get("scatterWeight")
+        weightText = "auto" if weight is None else f"{float(weight):g}"
+        return f"Dual energy window (lower {lower + 1}, weight {weightText})"
     return "None (upper-only window is not supported)"
+
+
+def autoScatterWeight(peakWidth, lowerWidth):
+    """Scatter weight k (scatter = k x lower window counts) that PyTomography's automatic dual
+    window estimate amounts to: the triple window formula with an empty upper window,
+    0.5 x photopeak width / lower window width."""
+    if not peakWidth or not lowerWidth or lowerWidth <= 0:
+        return None
+    return 0.5 * float(peakWidth) / float(lowerWidth)
 
 
 def filterDescription(params):
     if params["filter"] == "Gaussian":
-        return f"Gaussian sigma={params['sigma']} mm"
+        return f"Gaussian FWHM={params['fwhm']:g} mm"
     if params["filter"] == "Butterworth":
         return f"Butterworth cutoff={params['cutoff']:.2f} Nyquist, order={params['order']}"
+    if params["filter"] == "Hann":
+        return f"Hann cutoff={params['cutoff']:.2f} Nyquist"
     return "None"

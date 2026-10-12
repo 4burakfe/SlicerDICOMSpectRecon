@@ -239,12 +239,12 @@ def windowsMatch(a, b, tolerance=WINDOW_TOLERANCE_KEV):
 
 def setupKey(record):
     """What makes two calibrations comparable (for drift): same camera, collimator,
-    isotope, photopeak and scatter method."""
+    isotope, photopeak and scatter method (with its weight)."""
     camera = record.get("camera", {})
     photopeak = record.get("photopeak") or [0, 0]
     return (camera.get("model", ""), camera.get("serial", ""), record.get("collimator", ""),
             record.get("isotope", ""), round(float(photopeak[0])), round(float(photopeak[1])),
-            record.get("scatter", {}).get("method", "None"))
+            scatterLabel(record))
 
 
 def previousCalibration(records, record):
@@ -299,9 +299,20 @@ def findWindowIndex(windows, energyRange):
     return None
 
 
+def scatterLabel(record):
+    """Scatter method of a calibration, with the dual window weight: 'DEW k=1.1', 'DEW auto', 'TEW'.
+    Calibrations made before the weight existed used the automatic weight."""
+    scatter = record.get("scatter", {})
+    method = scatter.get("method", "None")
+    if method != "DEW":
+        return method
+    weight = scatter.get("weight")
+    return "DEW auto" if weight is None else f"DEW k={float(weight):g}"
+
+
 def describe(record):
     """One-line label for lists."""
-    scatter = record.get("scatter", {}).get("method", "None")
+    scatter = scatterLabel(record)
     created = str(record.get("created", ""))[:10]
     return (f"{record.get('name', 'unnamed')} - {record.get('isotope', '?')}, "
             f"{record.get('collimator', '?')}, SC {scatter}, "
@@ -460,6 +471,7 @@ def evaluatePhantom(attributes, voiSum, imageSum, activityMBq, measuredTime, mid
         add(WARNING, f"Data consistency {consistency:.3f} - is the phantom fully inside the field of view?")
 
     scatterMethod = attributes.get("ScatterMethod", "None") or "None"
+    scatterWeight = _number(attributes.get("ScatterWeight")) if scatterMethod == "DEW" else None
     record = {
         "isotope": isotope,
         "halfLifeSec": halfLifeSec,
@@ -472,7 +484,8 @@ def evaluatePhantom(attributes, voiSum, imageSum, activityMBq, measuredTime, mid
         "photopeak": photopeak,
         "scatter": {"method": scatterMethod,
                     "lower": _range(attributes.get("ScatterLowerRange")),
-                    "upper": _range(attributes.get("ScatterUpperRange"))},
+                    "upper": _range(attributes.get("ScatterUpperRange")),
+                    "weight": scatterWeight},
         "attenuationCorrection": "CT",
         "recon": {"iterations": int(_number(attributes.get("ReconIterations"), 0) or 0) or None,
                   "subsets": int(_number(attributes.get("ReconSubsets"), 0) or 0) or None,

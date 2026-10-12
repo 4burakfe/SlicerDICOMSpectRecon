@@ -4,6 +4,7 @@ import logging
 import os
 import traceback
 
+import ctk
 import numpy as np
 import qt
 import slicer
@@ -11,12 +12,29 @@ import slicer
 from .nmdata import (adjacentScatterWindows, cleanCtFiles, defaultPeakIndex, describeTiming,
                      readAcquisitionInfo, readNmInfo, scatterWindowProblem)
 from .reconstruction import (SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
-                             applyFilter, filterDescription, pytomographyVersion,
+                             applyFilter, autoScatterWeight, filterDescription, pytomographyVersion,
                              scaleCounts, scatterDescription)
 from . import display
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
+FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
+
+
+def _slider(minimum, maximum, step, decimals, value, suffix="", toolTip=""):
+    """Slider with an attached spin box (the usual Slicer parameter control)."""
+    slider = ctk.ctkSliderWidget()
+    slider.decimals = decimals
+    slider.singleStep = step
+    slider.pageStep = step
+    slider.minimum = minimum
+    slider.maximum = maximum
+    slider.value = value
+    if suffix:
+        slider.suffix = suffix
+    if toolTip:
+        slider.setToolTip(toolTip)
+    return slider
 
 
 def _dateTimeEdit():
@@ -117,6 +135,17 @@ def scatterMethodName(params):
     if params.get("indexLower") is None:
         return "None"
     return "TEW" if params.get("indexUpper") is not None else "DEW"
+
+
+def scatterWeightText(weight):
+    """Stored form of the dual window scatter weight: 'auto' or the number."""
+    return "auto" if weight is None else f"{float(weight):g}"
+
+
+def sameScatterWeight(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) < 1e-6
 
 
 class WheelScrollFilter(qt.QObject):
@@ -401,26 +430,15 @@ class SpectReconDialog:
 
         filterGroup, filterForm = _group("Post-filter - static" if self.isGated else "Post-filter")
         self.filterCombo = qt.QComboBox()
-        self.filterCombo.addItems(["None", "Gaussian", "Butterworth"])
+        self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
-        self.sigmaSpin = qt.QDoubleSpinBox()
-        self.sigmaSpin.setRange(0.1, 50.0)
-        self.sigmaSpin.setSingleStep(0.5)
-        self.sigmaSpin.setValue(2.0)
-        self.sigmaSpin.setSuffix(" mm")
-        self.sigmaSpin.setToolTip("Gaussian sigma")
-        self.cutoffSpin = qt.QDoubleSpinBox()
-        self.cutoffSpin.setRange(0.05, 1.0)
-        self.cutoffSpin.setSingleStep(0.05)
-        self.cutoffSpin.setDecimals(2)
-        self.cutoffSpin.setValue(0.45)
-        self.cutoffSpin.setSuffix(" x Nyq")
-        self.cutoffSpin.setToolTip("Conventional SPECT: 0.4-0.5 x Nyquist; lower (~0.2-0.3) for low-count studies")
-        self.orderSpin = qt.QSpinBox()
-        self.orderSpin.setRange(1, 20)
-        self.orderSpin.setValue(10)
-        self.orderSpin.setToolTip("Conventional SPECT: order 5-10")
-        for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("Sigma:", self.sigmaSpin),
+        self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 10.0, " mm", FWHM_TOOLTIP)
+        self.cutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.45, " x Nyq",
+                                  "Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
+                                  "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
+                                  "smooths more than Butterworth at the same value.")
+        self.orderSpin = _slider(1, 20, 1, 0, 10, "", "Conventional SPECT: order 5-10")
+        for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("FWHM:", self.fwhmSpin),
                                                ("Cutoff:", self.cutoffSpin), ("Order:", self.orderSpin)]):
             filterForm.addWidget(qt.QLabel(label), row, 0)
             filterForm.addWidget(widget, row, 1)
@@ -443,27 +461,15 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
             self.gatedFilterCombo = qt.QComboBox()
-            self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth"])
+            self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
-            self.gatedSigmaSpin = qt.QDoubleSpinBox()
-            self.gatedSigmaSpin.setRange(0.1, 50.0)
-            self.gatedSigmaSpin.setSingleStep(0.5)
-            self.gatedSigmaSpin.setValue(3.0)
-            self.gatedSigmaSpin.setSuffix(" mm")
-            self.gatedSigmaSpin.setToolTip("Gaussian sigma")
-            self.gatedCutoffSpin = qt.QDoubleSpinBox()
-            self.gatedCutoffSpin.setRange(0.05, 1.0)
-            self.gatedCutoffSpin.setSingleStep(0.05)
-            self.gatedCutoffSpin.setDecimals(2)
-            self.gatedCutoffSpin.setValue(0.35)
-            self.gatedCutoffSpin.setSuffix(" x Nyq")
-            self.gatedCutoffSpin.setToolTip("Gates hold fewer counts than the static image, so a lower cutoff is usual")
-            self.gatedOrderSpin = qt.QSpinBox()
-            self.gatedOrderSpin.setRange(1, 20)
-            self.gatedOrderSpin.setValue(10)
+            self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
+            self.gatedCutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.35, " x Nyq",
+                                           "Gates hold fewer counts than the static image, so a lower cutoff is usual")
+            self.gatedOrderSpin = _slider(1, 20, 1, 0, 10)
             gatedForm.addWidget(self.gatedEnableCheckBox, 0, 0, 1, 2)
             left = [("Iterations:", self.gatedItersSpin), ("Subsets:", self.gatedSubsetsSpin)]
-            right = [("Filter:", self.gatedFilterCombo), ("Sigma:", self.gatedSigmaSpin),
+            right = [("Filter:", self.gatedFilterCombo), ("FWHM:", self.gatedFwhmSpin),
                      ("Cutoff:", self.gatedCutoffSpin), ("Order:", self.gatedOrderSpin)]
             for row, (label, widget) in enumerate(left):
                 gatedForm.addWidget(qt.QLabel(label), row + 1, 0)
@@ -514,21 +520,32 @@ class SpectReconDialog:
             self.peakCombo.addItem(window["label"])
             self.lowerCombo.addItem(window["label"])
             self.upperCombo.addItem(window["label"])
+        self.scatterWeightSpin = qt.QDoubleSpinBox()
+        self.scatterWeightSpin.setRange(0.0, 5.0)
+        self.scatterWeightSpin.setSingleStep(0.05)
+        self.scatterWeightSpin.setDecimals(2)
+        self.scatterWeightSpin.setSpecialValueText("Auto")  # 0 = automatic
+        self.scatterWeightSpin.setValue(0.0)
+        self.scatterWeightSpin.setToolTip(
+            "Dual energy window scatter weight k: scatter = k x lower window counts.\n"
+            "Auto: 0.5 x photopeak width / lower window width (PyTomography's estimate).\n"
+            "Enter a value to match a vendor setting, e.g. GE Xeleris 'Scatter weight for Tc99m' = 1.1.")
         self.scatterNote = qt.QLabel("")
         self.scatterNote.setWordWrap(True)
         scatterForm.addWidget(self.scatterCheckBox, 0, 0, 1, 2)
         for row, (label, widget) in enumerate([("Peak:", self.peakCombo), ("Lower:", self.lowerCombo),
-                                               ("Upper:", self.upperCombo)]):
+                                               ("Upper:", self.upperCombo), ("Weight:", self.scatterWeightSpin)]):
             scatterForm.addWidget(qt.QLabel(label), row + 1, 0)
             scatterForm.addWidget(widget, row + 1, 1)
-        scatterForm.addWidget(self.scatterNote, 4, 0, 1, 2)
+        scatterForm.addWidget(self.scatterNote, 5, 0, 1, 2)
         scatterForm.setColumnStretch(1, 1)
-        scatterForm.setRowStretch(5, 1)
+        scatterForm.setRowStretch(6, 1)
         side.addLayout(_row(acGroup, scatterGroup))
         self.peakCombo.connect("currentIndexChanged(int)", self.onPeakWindowChanged)
         self.scatterCheckBox.connect("toggled(bool)", lambda checked: self._updateScatterState())
         self.lowerCombo.connect("currentIndexChanged(int)", lambda index: self._updateScatterState())
         self.upperCombo.connect("currentIndexChanged(int)", lambda index: self._updateScatterState())
+        self.scatterWeightSpin.connect("valueChanged(double)", lambda value: self._updateScatterState())
         self._initScatterWindows()
 
         # Quantification and SUV (collapsed until switched on)
@@ -805,6 +822,8 @@ class SpectReconDialog:
             self.lowerCombo.setCurrentIndex(0 if lower is None else lower + 1)
             self.upperCombo.setCurrentIndex(0 if upper is None else upper + 1)
             self.scatterCheckBox.setChecked(lower is not None)
+            weight = scatter.get("weight")
+            self.scatterWeightSpin.setValue(0.0 if weight is None else float(weight))
         self._updateScatterState()
 
         recon = calibration.get("recon", {})
@@ -813,7 +832,7 @@ class SpectReconDialog:
             warnings.append(f"calibrated with {recon.get('iterations')} iterations x {recon.get('subsets')} "
                             f"subsets, current {self.itersSpin.value} x {self.subsetsSpin.value}")
         text = (f"{float(calibration.get('cpsPerMBq', 0)):.3f} cps/MBq, AC CT, "
-                f"SC {scatter.get('method', 'None')}")
+                f"SC {quant.scatterLabel(calibration)}")
         if errors:
             text = "<span style='color:#d04040'>&#9888; Not usable: " + "; ".join(errors) + "</span>"
         elif warnings:
@@ -831,6 +850,7 @@ class SpectReconDialog:
         scatterAvailable = self._scatterAvailable()
         for widget in (self.scatterCheckBox, self.lowerCombo, self.upperCombo):
             widget.setEnabled(scatterAvailable and not locked)
+        self._updateWeightEnabled()
         self.peakCombo.setEnabled(not busy and not locked)
         self.scalingCombo.setEnabled(not self.quantGroup.checked)
         self.scalingCombo.setToolTip("Quantification works from acquisition counts (x number of views)"
@@ -853,6 +873,10 @@ class SpectReconDialog:
         if scatterMethodName(params) != wantedScatter:
             raise ValueError(f"The calibration was made with scatter correction '{wantedScatter}', "
                              f"the current setting is '{scatterMethodName(params)}'.")
+        wantedWeight = calibration.get("scatter", {}).get("weight")
+        if wantedScatter == "DEW" and not sameScatterWeight(wantedWeight, params.get("scatterWeight")):
+            raise ValueError(f"The calibration was made with scatter weight {scatterWeightText(wantedWeight)}, "
+                             f"the current setting is {scatterWeightText(params.get('scatterWeight'))}.")
         duration = params["quant"]["duration"]
         if duration <= 0:
             raise ValueError("Enter the counting duration of the acquisition.")
@@ -924,6 +948,8 @@ class SpectReconDialog:
             "ScanMidTime": quant.toIso(self._midTime()) if hasattr(self, "midTimeEdit") else acq.get("mid", ""),
             "PhotopeakRange": energyRange(params["indexPeak"]),
             "ScatterMethod": scatterMethodName(params),
+            "ScatterWeight": scatterWeightText(params.get("scatterWeight"))
+                             if scatterMethodName(params) == "DEW" else "",
             "ScatterLowerRange": energyRange(params["indexLower"]) if params["indexLower"] is not None else "",
             "ScatterUpperRange": energyRange(params["indexUpper"]) if params["indexUpper"] is not None else "",
             "ReconIterations": params["iters"], "ReconSubsets": params["subsets"],
@@ -981,6 +1007,7 @@ class SpectReconDialog:
         self.scatterCheckBox.setEnabled(available)
         for combo in (self.peakCombo, self.lowerCombo, self.upperCombo):
             combo.setEnabled(available)
+        self.scatterWeightSpin.setEnabled(False)
         if not available:
             count = len(self.energyWindows)
             self.scatterNote.setText(f"<i>{count} energy window in this acquisition - "
@@ -1025,9 +1052,28 @@ class SpectReconDialog:
         """Scatter windows exist (independent of the widget being locked by a calibration)."""
         return len(self.energyWindows) > 1
 
+    def _isDualWindow(self):
+        return (self._scatterAvailable() and bool(self.scatterCheckBox.checked)
+                and self.lowerCombo.currentIndex > 0 and self.upperCombo.currentIndex <= 0)
+
+    def _updateWeightEnabled(self):
+        """The manual weight applies to dual window correction only."""
+        locked = getattr(self, "quantLocked", False)
+        self.scatterWeightSpin.setEnabled(self._isDualWindow() and not locked)
+
+    def _autoWeight(self):
+        """Weight the automatic dual window estimate amounts to, from the window widths."""
+        peak = self.peakCombo.currentIndex
+        lower = self.lowerCombo.currentIndex - 1
+        if not (0 <= peak < len(self.energyWindows)) or not (0 <= lower < len(self.energyWindows)):
+            return None
+        width = lambda w: (w["high"] - w["low"]) if w.get("low") is not None and w.get("high") is not None else None
+        return autoScatterWeight(width(self.energyWindows[peak]), width(self.energyWindows[lower]))
+
     def _updateScatterState(self):
         if not self._scatterAvailable():
             return
+        self._updateWeightEnabled()
         lower = self.lowerCombo.currentIndex - 1
         upper = self.upperCombo.currentIndex - 1
         if not self.scatterCheckBox.checked:
@@ -1043,7 +1089,12 @@ class SpectReconDialog:
         elif lower >= 0 and upper >= 0:
             self.scatterNote.setText("<i>triple energy window</i>")
         else:
-            self.scatterNote.setText("<i>dual energy window (lower window only)</i>")
+            if self.scatterWeightSpin.value > 0:
+                weightNote = f"weight {self.scatterWeightSpin.value:g} (manual)"
+            else:
+                auto = self._autoWeight()
+                weightNote = f"weight auto = {auto:.2f}" if auto else "weight auto"
+            self.scatterNote.setText(f"<i>dual energy window (lower window only), {weightNote}</i>")
 
     def onCtSeriesChanged(self, index):
         if index < 0 or index >= len(self.ctCandidates):
@@ -1208,14 +1259,14 @@ class SpectReconDialog:
 
     def onFilterChanged(self, index):
         name = self.filterCombo.currentText
-        self.sigmaSpin.setEnabled(name == "Gaussian")
-        self.cutoffSpin.setEnabled(name == "Butterworth")
+        self.fwhmSpin.setEnabled(name == "Gaussian")
+        self.cutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.orderSpin.setEnabled(name == "Butterworth")
 
     def onGatedFilterChanged(self, index):
         name = self.gatedFilterCombo.currentText
-        self.gatedSigmaSpin.setEnabled(name == "Gaussian")
-        self.gatedCutoffSpin.setEnabled(name == "Butterworth")
+        self.gatedFwhmSpin.setEnabled(name == "Gaussian")
+        self.gatedCutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.gatedOrderSpin.setEnabled(name == "Butterworth")
 
     def log(self, message):
@@ -1232,13 +1283,14 @@ class SpectReconDialog:
             "attenuationCorrection": bool(self.acCheckBox.checked) and bool(self.ctFiles),
             "ctId": (self.ctFiles[0], len(self.ctFiles)) if self.ctFiles else None,
             "filter": self.filterCombo.currentText,
-            "sigma": self.sigmaSpin.value,
+            "fwhm": self.fwhmSpin.value,
             "cutoff": self.cutoffSpin.value,
-            "order": self.orderSpin.value,
+            "order": int(round(self.orderSpin.value)),
             "scaling": self.scalingCombo.currentText,
             "indexPeak": max(0, self.peakCombo.currentIndex),
             "indexLower": None,
             "indexUpper": None,
+            "scatterWeight": None,
             "gated": False,
         }
         if self._scatterAvailable() and self.scatterCheckBox.checked:
@@ -1246,15 +1298,17 @@ class SpectReconDialog:
             upper = self.upperCombo.currentIndex - 1
             params["indexLower"] = lower if lower >= 0 else None
             params["indexUpper"] = upper if upper >= 0 else None
+            if self._isDualWindow() and self.scatterWeightSpin.value > 0:
+                params["scatterWeight"] = float(self.scatterWeightSpin.value)
         if self.isGated:
             params.update({
                 "gated": bool(self.gatedEnableCheckBox.checked),
                 "gatedIters": self.gatedItersSpin.value,
                 "gatedSubsets": self.gatedSubsetsSpin.value,
                 "gatedFilter": self.gatedFilterCombo.currentText,
-                "gatedSigma": self.gatedSigmaSpin.value,
+                "gatedFwhm": self.gatedFwhmSpin.value,
                 "gatedCutoff": self.gatedCutoffSpin.value,
-                "gatedOrder": self.gatedOrderSpin.value,
+                "gatedOrder": int(round(self.gatedOrderSpin.value)),
             })
         params["quant"] = None
         params["suv"] = None
@@ -1278,7 +1332,7 @@ class SpectReconDialog:
     def scatterArgument(params):
         if params["indexLower"] is None and params["indexUpper"] is None:
             return None
-        return (params["indexLower"], params["indexUpper"])
+        return (params["indexLower"], params["indexUpper"], params.get("scatterWeight"))
 
     @staticmethod
     def reconKeyFor(params, gated=False):
@@ -1289,13 +1343,13 @@ class SpectReconDialog:
         subsets = params["gatedSubsets"] if gated else params["subsets"]
         ctId = params["ctId"] if params["attenuationCorrection"] else None
         return (iters, subsets, params["attenuationCorrection"], ctId, params["indexPeak"],
-                params["indexLower"], params["indexUpper"], prefix)
+                params["indexLower"], params["indexUpper"], params.get("scatterWeight"), prefix)
 
     @staticmethod
     def filterParams(params, gated=False):
         if not gated:
-            return {k: params[k] for k in ("filter", "sigma", "cutoff", "order")}
-        return {"filter": params["gatedFilter"], "sigma": params["gatedSigma"],
+            return {k: params[k] for k in ("filter", "fwhm", "cutoff", "order")}
+        return {"filter": params["gatedFilter"], "fwhm": params["gatedFwhm"],
                 "cutoff": params["gatedCutoff"], "order": params["gatedOrder"]}
 
     def _setBusy(self, busy):
@@ -1603,19 +1657,20 @@ class SpectReconDialog:
 
     def _watchSettings(self):
         """Re-check the Load state whenever any setting in the side panel changes."""
-        watched = [self.itersSpin, self.subsetsSpin, self.filterCombo, self.sigmaSpin, self.cutoffSpin,
+        watched = [self.itersSpin, self.subsetsSpin, self.filterCombo, self.fwhmSpin, self.cutoffSpin,
                    self.orderSpin, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
-                   self.peakCombo, self.lowerCombo, self.upperCombo, self.quantGroup, self.calibrationCombo,
+                   self.peakCombo, self.lowerCombo, self.upperCombo, self.scatterWeightSpin,
+                   self.quantGroup, self.calibrationCombo,
                    self.durationSpin, self.midTimeEdit, self.midTimeFromDicom, self.suvGroup, self.suvTypeCombo,
                    self.syringeSpin, self.syringeTimeEdit, self.residualSpin, self.residualTimeEdit,
                    self.weightSpin, self.heightSpin, self.sexCombo]
         if self.isGated:
             watched += [self.gatedEnableCheckBox, self.gatedItersSpin, self.gatedSubsetsSpin,
-                        self.gatedFilterCombo, self.gatedSigmaSpin, self.gatedCutoffSpin, self.gatedOrderSpin]
+                        self.gatedFilterCombo, self.gatedFwhmSpin, self.gatedCutoffSpin, self.gatedOrderSpin]
         for widget in watched:
             if isinstance(widget, qt.QDateTimeEdit):
                 signal = "dateTimeChanged(QDateTime)"
-            elif isinstance(widget, qt.QDoubleSpinBox):
+            elif isinstance(widget, (qt.QDoubleSpinBox, ctk.ctkSliderWidget)):
                 signal = "valueChanged(double)"
             elif isinstance(widget, qt.QSpinBox):
                 signal = "valueChanged(int)"

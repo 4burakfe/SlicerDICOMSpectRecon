@@ -446,12 +446,15 @@ def _reloadLibInDeveloperMode():
         if not slicer.util.settingsValue("Developer/DeveloperMode", False, converter=slicer.util.toBool):
             return
         import importlib
-        import DICOMSpectReconLib.nmdata as nmdata
-        import DICOMSpectReconLib.reconstruction as reconstruction
-        import DICOMSpectReconLib.display as display
-        import DICOMSpectReconLib.dialog as dialog
-        for module in (nmdata, reconstruction, display, dialog):  # dependency order
-            importlib.reload(module)
+        import sys
+        # Dependency order; reload each one before importing the next, so a module is never
+        # first imported against a stale (not yet reloaded) dependency
+        for name in ("nmdata", "quantification", "reconstruction", "display", "dialog"):
+            fullName = f"DICOMSpectReconLib.{name}"
+            if fullName in sys.modules:
+                importlib.reload(sys.modules[fullName])
+            else:
+                importlib.import_module(fullName)
     except Exception:
         logging.warning("Could not reload DICOMSpectReconLib:\n" + traceback.format_exc())
 
