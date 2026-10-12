@@ -4,6 +4,7 @@ import logging
 import os
 import traceback
 
+import ctk
 import numpy as np
 import qt
 import slicer
@@ -17,6 +18,23 @@ from . import display
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
+FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
+
+
+def _slider(minimum, maximum, step, decimals, value, suffix="", toolTip=""):
+    """Slider with an attached spin box (the usual Slicer parameter control)."""
+    slider = ctk.ctkSliderWidget()
+    slider.decimals = decimals
+    slider.singleStep = step
+    slider.pageStep = step
+    slider.minimum = minimum
+    slider.maximum = maximum
+    slider.value = value
+    if suffix:
+        slider.suffix = suffix
+    if toolTip:
+        slider.setToolTip(toolTip)
+    return slider
 
 
 def _dateTimeEdit():
@@ -414,25 +432,12 @@ class SpectReconDialog:
         self.filterCombo = qt.QComboBox()
         self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
-        self.fwhmSpin = qt.QDoubleSpinBox()
-        self.fwhmSpin.setRange(0.5, 100.0)
-        self.fwhmSpin.setSingleStep(0.5)
-        self.fwhmSpin.setValue(5.0)
-        self.fwhmSpin.setSuffix(" mm")
-        self.fwhmSpin.setToolTip("Gaussian full width at half maximum (FWHM = 2.355 x sigma)")
-        self.cutoffSpin = qt.QDoubleSpinBox()
-        self.cutoffSpin.setRange(0.05, 1.0)
-        self.cutoffSpin.setSingleStep(0.05)
-        self.cutoffSpin.setDecimals(2)
-        self.cutoffSpin.setValue(0.45)
-        self.cutoffSpin.setSuffix(" x Nyq")
-        self.cutoffSpin.setToolTip("Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
-                                   "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
-                                   "smooths more than Butterworth at the same value.")
-        self.orderSpin = qt.QSpinBox()
-        self.orderSpin.setRange(1, 20)
-        self.orderSpin.setValue(10)
-        self.orderSpin.setToolTip("Conventional SPECT: order 5-10")
+        self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 5.0, " mm", FWHM_TOOLTIP)
+        self.cutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.45, " x Nyq",
+                                  "Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
+                                  "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
+                                  "smooths more than Butterworth at the same value.")
+        self.orderSpin = _slider(1, 20, 1, 0, 10, "", "Conventional SPECT: order 5-10")
         for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("FWHM:", self.fwhmSpin),
                                                ("Cutoff:", self.cutoffSpin), ("Order:", self.orderSpin)]):
             filterForm.addWidget(qt.QLabel(label), row, 0)
@@ -458,22 +463,10 @@ class SpectReconDialog:
             self.gatedFilterCombo = qt.QComboBox()
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
-            self.gatedFwhmSpin = qt.QDoubleSpinBox()
-            self.gatedFwhmSpin.setRange(0.5, 100.0)
-            self.gatedFwhmSpin.setSingleStep(0.5)
-            self.gatedFwhmSpin.setValue(7.0)
-            self.gatedFwhmSpin.setSuffix(" mm")
-            self.gatedFwhmSpin.setToolTip("Gaussian full width at half maximum (FWHM = 2.355 x sigma)")
-            self.gatedCutoffSpin = qt.QDoubleSpinBox()
-            self.gatedCutoffSpin.setRange(0.05, 1.0)
-            self.gatedCutoffSpin.setSingleStep(0.05)
-            self.gatedCutoffSpin.setDecimals(2)
-            self.gatedCutoffSpin.setValue(0.35)
-            self.gatedCutoffSpin.setSuffix(" x Nyq")
-            self.gatedCutoffSpin.setToolTip("Gates hold fewer counts than the static image, so a lower cutoff is usual")
-            self.gatedOrderSpin = qt.QSpinBox()
-            self.gatedOrderSpin.setRange(1, 20)
-            self.gatedOrderSpin.setValue(10)
+            self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 7.0, " mm", FWHM_TOOLTIP)
+            self.gatedCutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.35, " x Nyq",
+                                           "Gates hold fewer counts than the static image, so a lower cutoff is usual")
+            self.gatedOrderSpin = _slider(1, 20, 1, 0, 10)
             gatedForm.addWidget(self.gatedEnableCheckBox, 0, 0, 1, 2)
             left = [("Iterations:", self.gatedItersSpin), ("Subsets:", self.gatedSubsetsSpin)]
             right = [("Filter:", self.gatedFilterCombo), ("FWHM:", self.gatedFwhmSpin),
@@ -1292,7 +1285,7 @@ class SpectReconDialog:
             "filter": self.filterCombo.currentText,
             "fwhm": self.fwhmSpin.value,
             "cutoff": self.cutoffSpin.value,
-            "order": self.orderSpin.value,
+            "order": int(round(self.orderSpin.value)),
             "scaling": self.scalingCombo.currentText,
             "indexPeak": max(0, self.peakCombo.currentIndex),
             "indexLower": None,
@@ -1315,7 +1308,7 @@ class SpectReconDialog:
                 "gatedFilter": self.gatedFilterCombo.currentText,
                 "gatedFwhm": self.gatedFwhmSpin.value,
                 "gatedCutoff": self.gatedCutoffSpin.value,
-                "gatedOrder": self.gatedOrderSpin.value,
+                "gatedOrder": int(round(self.gatedOrderSpin.value)),
             })
         params["quant"] = None
         params["suv"] = None
@@ -1677,7 +1670,7 @@ class SpectReconDialog:
         for widget in watched:
             if isinstance(widget, qt.QDateTimeEdit):
                 signal = "dateTimeChanged(QDateTime)"
-            elif isinstance(widget, qt.QDoubleSpinBox):
+            elif isinstance(widget, (qt.QDoubleSpinBox, ctk.ctkSliderWidget)):
                 signal = "valueChanged(double)"
             elif isinstance(widget, qt.QSpinBox):
                 signal = "valueChanged(int)"
