@@ -252,7 +252,12 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
                 tooltip += "\nSelect the CT series as well to enable attenuation correction"
             loadable.tooltip = tooltip
             loadable.selected = True
-            loadable.confidence = 0.95  # beat the generic scalar volume plugin
+            # Above 1.0: the DICOM browser keeps only the highest confidence loadables of each series
+            # (DICOMUtils.selectHighestConfidenceLoadables, grouped by the series of their first file).
+            # With two NM series selected, MultiVolumeImporter lumps them into one multi-series
+            # loadable of confidence 1.0, which would otherwise deselect the reconstruction of one of
+            # them; the scalar volume plugin offers less than that.
+            loadable.confidence = 1.05
             loadables.append(loadable)
         return loadables
 
