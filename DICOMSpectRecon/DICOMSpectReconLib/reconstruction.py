@@ -10,7 +10,7 @@ import tempfile
 
 import numpy as np
 
-from .nmdata import readNmInfo, writeGateFile, writeSummedGatesFile
+from .nmdata import prepareProjectionFile, readNmInfo, writeGateFile, writeSummedGatesFile
 
 
 # Output count scaling modes (see module docstring)
@@ -129,6 +129,11 @@ class SpectReconLogic:
         self.device = device
         self.log(f"Using device: {device}  |  PyTomography {pytomographyVersion()}")
 
+        try:
+            inputDcm = prepareProjectionFile(inputDcm, self.tempDir, self.log)
+        except Exception as e:
+            self.log(f"(Could not check the detector radii: {e})")
+        self.inputDcm = inputDcm
         nmInfo = readNmInfo(inputDcm)
         self.gateNumbers = nmInfo["gateNumbers"]
         self.nGates = nmInfo["nGates"]

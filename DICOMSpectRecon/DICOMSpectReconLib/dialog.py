@@ -1,5 +1,6 @@
 """Interactive preview window shown when a SPECT projection series is loaded."""
 
+import json
 import logging
 import os
 import traceback
@@ -10,7 +11,7 @@ import qt
 import slicer
 
 from .nmdata import (adjacentScatterWindows, cleanCtFiles, defaultPeakIndex, describeTiming,
-                     readAcquisitionInfo, readNmInfo, scatterWindowProblem)
+                     readAcquisitionInfo, readGatingInfo, readNmInfo, scatterWindowProblem)
 from .reconstruction import (SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
                              applyFilter, autoScatterWeight, filterDescription, pytomographyVersion,
                              scaleCounts, scatterDescription)
@@ -253,6 +254,13 @@ class SpectReconDialog:
             logging.warning("Could not read acquisition info:\n" + traceback.format_exc())
             self.acquisition = {"warnings": [f"Acquisition info could not be read: {e}"],
                                 "windows": self.energyWindows}
+        # ECG gating fields (R-R window, beats, frame timing), kept on the volumes for gated QC
+        self.gatingInfo = {}
+        if self.isGated:
+            try:
+                self.gatingInfo = readGatingInfo(inputDcm)
+            except Exception:
+                logging.warning("Could not read the gating information:\n" + traceback.format_exc())
         self.calibrations = []
         self.quantLocked = False
         self.units = "counts"
@@ -464,8 +472,10 @@ class SpectReconDialog:
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
             self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
-            self.gatedCutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.35, " x Nyq",
-                                           "Gates hold fewer counts than the static image, so a lower cutoff is usual")
+            self.gatedCutoffSpin = _slider(
+                0.05, 1.0, 0.01, 2, 0.50, " x Nyq",
+                "Gated SPECT: about 0.4-0.5 x Nyquist. Lower cutoffs blur the end-systolic cavity away and "
+                "overestimate the EF (beating phantom: EF stable from 0.5-0.6, EF 91 % instead of 69 % at 0.2; Duarte et al., J Nucl Med Technol 2012)")
             self.gatedOrderSpin = _slider(1, 20, 1, 0, 10)
             gatedForm.addWidget(self.gatedEnableCheckBox, 0, 0, 1, 2)
             left = [("Iterations:", self.gatedItersSpin), ("Subsets:", self.gatedSubsetsSpin)]
@@ -1561,6 +1571,8 @@ class SpectReconDialog:
                 self.info["CTMatch"] = self.ctMatchType
             if self.isGated:
                 self.info["StaticFrom"] = f"sum of {self.nGates} gates"
+                self.info["GateNumbers"] = json.dumps([int(g) for g in self.gateNumbers])
+                self.info.update(self.gatingInfo)
             self._setReconArray(sitk.GetArrayFromImage(self.filteredImage))
 
             sp = self.filteredImage.GetSpacing()
@@ -1619,6 +1631,9 @@ class SpectReconDialog:
         self.gateMax = max((display.displayReference(a) for a in self.gateArrays if a.size), default=1.0)
         self.gateIndex = min(self.gateIndex, len(self.gateArrays) - 1)
         self.info["Gates"] = self.nGates
+        # Photopeak projection counts of every gate: equal counts mean the beats filled all gates
+        self.info["GatePhotopeakCounts"] = json.dumps(
+            [round(float(stats.get("photopeakCounts") or 0.0)) for stats in self.gateRawStats])
         self.info["GatedIterations"] = params["gatedIters"]
         self.info["GatedSubsets"] = params["gatedSubsets"]
         self.info["GatedPostFilter"] = filterDescription(gatedFilter)

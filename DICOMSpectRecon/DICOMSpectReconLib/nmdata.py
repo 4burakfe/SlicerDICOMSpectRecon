@@ -1,4 +1,4 @@
-"""NM projection data: header inspection (energy windows, gating), energy window
+"""NM projection data: header inspection (energy windows, gating, ECG gating fields), energy window
 defaults and validation, CT series cleanup, and writing gated data as plain NM files.
 
 No Slicer dependency: needs only numpy and pydicom (imported when used).
@@ -312,6 +312,66 @@ def writeSummedGatesFile(sourceFile, outPath, log=print):
     newFrames = np.rint(summed).astype(originalDtype)
     _writeUngatedCopy(ds, vectors, template, newFrames, outPath)
     return scale
+
+
+def _medisoRadii(ds, rotation, views):
+    """Radius of every view in mm for a Mediso file without RadialPosition in the rotation item:
+    the per-view list of the 'MEDISO-1' block (0009,xx26), else the detector's RadialPosition."""
+    values = _asList(_privateElement(rotation, 0x0009, "MEDISO-1", 0x26))
+    try:
+        values = [float(v) for v in values]
+    except (TypeError, ValueError):
+        values = []
+    viewOfFrame = np.atleast_1d(np.asarray(getattr(ds, "AngularViewVector", []), dtype=int))
+    if views and len(values) == viewOfFrame.size > views:
+        # one value per frame (gated files): the mean over the frames of each view
+        values = [float(np.mean(np.asarray(values)[viewOfFrame == view])) if np.any(viewOfFrame == view) else 0.0
+                  for view in range(1, views + 1)]
+    if len(values) == views and all(50.0 <= v <= 1000.0 for v in values):
+        return values, "Mediso per-view radii (0009,1026)"
+    detector = _first(getattr(ds, "DetectorInformationSequence", None))
+    value = getattr(detector, "RadialPosition", None) if detector is not None else None
+    if value is not None:
+        values = [float(v) for v in _asList(value)]
+        if len(values) in (1, views):
+            return values, "DetectorInformationSequence RadialPosition"
+    return None, ""
+
+
+def fillRadialPositions(ds):
+    """PyTomography reads the radii of Mediso data only from RotationInformationSequence >
+    RadialPosition. Some Mediso exports (e.g. AnyScan, Nucline 2.00) keep them only in the
+    detector item and a private per-view (or per-frame) list: copy them into the rotation item.
+    Returns a description of what was filled, or "" when nothing was needed or possible."""
+    if str(getattr(ds, "Manufacturer", "")).strip() != "Mediso":
+        return ""
+    filled = []
+    for rotation in getattr(ds, "RotationInformationSequence", None) or ():
+        if "RadialPosition" in rotation:
+            continue
+        views = int(getattr(rotation, "NumberOfFramesInRotation", 0) or 0)
+        radii, source = _medisoRadii(ds, rotation, views)
+        if radii is None:
+            continue
+        rotation.RadialPosition = radii[0] if len(radii) == 1 else radii
+        filled.append(source)
+    return ", ".join(sorted(set(filled)))
+
+
+def prepareProjectionFile(sourceFile, outDir, log=print):
+    """The NM file to reconstruct: the source itself, or a copy in outDir with the fields PyTomography
+    needs filled in (see fillRadialPositions)."""
+    import os
+    import pydicom
+    header = pydicom.dcmread(sourceFile, stop_before_pixels=True)
+    if not fillRadialPositions(header):
+        return sourceFile
+    ds = pydicom.dcmread(sourceFile)
+    source = fillRadialPositions(ds)
+    outPath = os.path.join(outDir, "projections_fixed.dcm")
+    ds.save_as(outPath)
+    log(f"Detector radii were missing from the rotation information; taken from {source}.")
+    return outPath
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +702,189 @@ def readAcquisitionInfo(filePath):
     info["sex"] = _text(getattr(ds, "PatientSex", ""))[:1].upper()
 
     info["windows"] = readNmInfo(filePath)["windows"]
+    return info
+
+
+# ---------------------------------------------------------------------------
+# ECG gating information (R-R window, accepted / rejected beats, frame timing)
+# ---------------------------------------------------------------------------
+# Standard NM attributes. Scanners put them in the Gated Information Sequence (0054,0062) > Data
+# Information Sequence (0054,0063), some at the top level. Mediso writes one Data Information item per
+# projection view (its R-R window and beats), others one item for the whole acquisition.
+_GATING_FLAGS = [   # (attribute key, DICOM keyword, kind): one value for the acquisition
+    ("GatingFramingType", "CardiacFramingType", "text"),            # (0018,1064) FORW / BACK / PCNT
+    ("GatingTriggerTimeMs", "TriggerTime", "number"),               # (0018,1060)
+    ("GatingBeatRejection", "BeatRejectionFlag", "text"),           # (0018,1080) Y / N
+    ("GatingPVCRejection", "PVCRejection", "text"),                 # (0018,1085)
+    ("GatingSkipBeats", "SkipBeats", "number"),                     # (0018,1086)
+    ("GatingTimeSlots", "NumberOfTimeSlots", "number"),             # (0054,0071)
+    ("GatingRRIntervals", "NumberOfRRIntervals", "number"),         # (0054,0061) R-R windows (bins)
+]
+_GATING_ITEM_FIELDS = [   # (name, DICOM keyword): one value per Data Information item
+    ("NominalIntervalMs", "NominalInterval"),                       # (0018,1062) average R-R
+    ("FrameTimeMs", "FrameTime"),                                   # (0018,1063)
+    ("LowRRMs", "LowRRValue"),                                      # (0018,1081) accepted R-R window
+    ("HighRRMs", "HighRRValue"),                                    # (0018,1082)
+    ("IntervalsAcquired", "IntervalsAcquired"),                     # (0018,1083) accepted beats
+    ("IntervalsRejected", "IntervalsRejected"),                     # (0018,1084)
+    ("HeartRateBpm", "HeartRate"),                                  # (0018,1088)
+]
+
+
+def _number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else round(number, 3)
+
+
+def readGatingInfo(filePath):
+    """ECG gating fields of an NM file as {attribute key: value} (only the ones present): accepted R-R
+    window, beats acquired / rejected, heart rate, frame and time slot timing. Values are numbers or
+    text; per item lists are JSON (GatingPerItem..., per projection view when GatingItemsAreViews is 1).
+    A heart rate or R-R interval of 0 means "not recorded" and is left out. When the scanner gives no
+    R-R interval it is estimated as frame time x time slots / accepted beats (GatingNominalIntervalSource).
+    Empty for a file without gating."""
+    import json
+    import pydicom
+    ds = pydicom.dcmread(filePath, stop_before_pixels=True)
+    gatedItems = list(getattr(ds, "GatedInformationSequence", None) or [])
+    dataItems = [item for gated in gatedItems for item in (getattr(gated, "DataInformationSequence", None) or [])]
+    info = {}
+    for key, keyword, kind in _GATING_FLAGS:
+        for source in [ds] + gatedItems:
+            value = getattr(source, keyword, None)
+            if value is None or value == "":
+                continue
+            value = _number(value) if kind == "number" else _text(value)
+            if value is not None and value != "":
+                info[key] = value
+                break
+
+    items = dataItems or [ds]
+    perItem = {}
+    for name, keyword in _GATING_ITEM_FIELDS:
+        values = [_number(getattr(item, keyword, None)) for item in items]
+        if name in ("NominalIntervalMs", "HeartRateBpm", "LowRRMs", "HighRRMs"):
+            values = [v if v else None for v in values]          # 0 = not recorded
+        if not any(v is not None for v in values) and dataItems:
+            # GE puts the heart rate (and some scanners other fields) at the top level, not in the item
+            for source in [ds] + gatedItems:
+                value = _number(getattr(source, keyword, None))
+                if value:
+                    values = [value]
+                    break
+        if any(v is not None for v in values):
+            perItem[name] = values
+    if not perItem and not info:
+        return {}
+    slots = int(info.get("GatingTimeSlots") or 0)
+    nFrames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    windows = max(1, len(getattr(ds, "EnergyWindowInformationSequence", None) or []))
+    views = nFrames // max(1, slots * windows) if slots else 0
+    info["GatingDataItems"] = len(dataItems)
+    info["GatingItemsAreViews"] = int(len(dataItems) > 1 and len(dataItems) == views)
+    if views:
+        info["GatingViews"] = views
+
+    def known(name):
+        return [v for v in perItem.get(name, []) if v is not None]
+
+    def median(name):
+        values = known(name)
+        return _number(float(np.median(values))) if values else None
+
+    acquired, rejected = known("IntervalsAcquired"), known("IntervalsRejected")
+    if acquired:
+        info["GatingIntervalsAcquired"] = int(sum(acquired))
+    if rejected:
+        info["GatingIntervalsRejected"] = int(sum(rejected))
+    if acquired and rejected and sum(acquired) + sum(rejected) > 0:
+        info["GatingRejectedPercent"] = round(100.0 * sum(rejected) / (sum(acquired) + sum(rejected)), 1)
+    for key, name in (("GatingFrameTimeMs", "FrameTimeMs"), ("GatingLowRRMs", "LowRRMs"), ("GatingHighRRMs", "HighRRMs")):
+        value = median(name)
+        if value is not None:
+            info[key] = value
+
+    # Average R-R, in this order: the scanner's nominal interval, its heart rate, else from the frame
+    # time. Frame Time (0018,1063) is the width of one time slot on GE (R-R = frame time x slots) but
+    # the time summed over the view's accepted beats on Mediso (R-R = frame time x slots / beats): the
+    # reading that gives a plausible R-R (inside the accepted window when there is one) is used.
+    def plausible(rr):
+        low, high = info.get("GatingLowRRMs"), info.get("GatingHighRRMs")
+        if low and high:
+            return 0.8 * low <= rr <= 1.2 * high
+        return 250.0 <= rr <= 2500.0
+
+    nominal = perItem.get("NominalIntervalMs") if known("NominalIntervalMs") else None
+    source = "DICOM nominal interval"
+    heartRate = median("HeartRateBpm")
+    if nominal is None and heartRate:
+        nominal = [round(60000.0 / heartRate, 1)]
+        source = "DICOM heart rate"
+    if nominal is None and known("LowRRMs") and known("HighRRMs"):
+        # the accepted window is set around the patient's mean R-R: its middle
+        values = [round(0.5 * (low + high), 1) if low and high else None
+                  for low, high in zip(perItem["LowRRMs"], perItem["HighRRMs"])]
+        nominal, source = values, "middle of the accepted R-R window"
+        if len(values) > 1:
+            perItem["NominalIntervalMs"] = values
+    if nominal is None and slots and "FrameTimeMs" in perItem:
+        beats = perItem.get("IntervalsAcquired") or [None] * len(perItem["FrameTimeMs"])
+        for reading, estimate in (
+                ("estimated: frame time x time slots / accepted beats", lambda f, a: f * slots / a if f and a else None),
+                ("estimated: frame time x time slots", lambda f, a: f * slots if f else None)):
+            values = [estimate(f, a) for f, a in zip(perItem["FrameTimeMs"], beats)]
+            values = [round(v, 1) if v is not None and plausible(v) else None for v in values]
+            if any(v is not None for v in values):
+                nominal, source = values, reading
+                if len(values) > 1:
+                    perItem["NominalIntervalMs"] = values
+                break
+    pairs = [(n, a or 1) for n, a in zip(nominal or [], perItem.get("IntervalsAcquired") or [1] * len(nominal or []))
+             if n is not None]
+    if pairs:
+        mean = sum(n * a for n, a in pairs) / sum(a for _, a in pairs)
+        info["GatingNominalIntervalMs"] = round(mean, 1)
+        info["GatingNominalIntervalSource"] = source
+        if slots:
+            frameTime = info.get("GatingFrameTimeMs")
+            # GE: the frame time is the slot width itself; otherwise the R-R split into the slots
+            info["GatingSlotWidthMs"] = frameTime if frameTime and plausible(frameTime * slots) \
+                else round(mean / slots, 1)
+        if info.get("GatingLowRRMs") and info.get("GatingHighRRMs"):
+            info["GatingRRWindowPercent"] = round(50.0 * (info["GatingHighRRMs"] - info["GatingLowRRMs"]) / mean, 1)
+        # Do the beat counts cover one projection view or the whole acquisition?
+        beats = (info.get("GatingIntervalsAcquired") or 0) + (info.get("GatingIntervalsRejected") or 0)
+        viewMs = _number(getattr(_first(getattr(ds, "RotationInformationSequence", None)) or ds,
+                                 "ActualFrameDuration", None)) or _number(getattr(ds, "ActualFrameDuration", None))
+        if beats and viewMs and len(dataItems) <= 1:
+            info["GatingBeatsScope"] = "view" if beats * mean < 2.0 * viewMs else "acquisition"
+        elif info["GatingItemsAreViews"]:
+            info["GatingBeatsScope"] = "acquisition"
+    if heartRate:
+        info["GatingHeartRateBpm"] = heartRate
+        info["GatingHeartRateSource"] = "DICOM heart rate"
+    elif info.get("GatingNominalIntervalMs"):
+        info["GatingHeartRateBpm"] = round(60000.0 / float(info["GatingNominalIntervalMs"]), 1)
+        info["GatingHeartRateSource"] = "from the R-R interval"
+    startRate = _number(_privateElement(ds, 0x0009, "GEMS_GENIE_1", 0x37))    # GE "Starting Heart Rate"
+    if startRate:
+        info["GatingStartHeartRateBpm"] = startRate
+
+    if len(items) > 1:
+        for name, values in perItem.items():
+            info[f"GatingPerItem{name}"] = json.dumps(values)
+    slotItems = []
+    for source in [ds] + gatedItems + dataItems[:1]:
+        slotItems = list(getattr(source, "TimeSlotInformationSequence", None) or [])
+        if slotItems:
+            break
+    slotTimes = [_number(getattr(slot, "TimeSlotTime", None)) for slot in slotItems]
+    if slotTimes and all(v is not None for v in slotTimes):
+        info["GatingTimeSlotTimesMs"] = json.dumps(slotTimes)    # (0054,0073), first data item
+    info["GatingInfoSource"] = "DICOM NM gating attributes"
     return info
 
 

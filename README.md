@@ -28,7 +28,12 @@ Author: Burak Demir, MD, FEBNM
   The dual window weight is automatic (0.5 x photopeak width / lower window width) or can be set
   by hand, e.g. 1.1 to match GE Xeleris' "Scatter weight for Tc99m".
 - **Gated studies**: gated reconstruction in cine plus the summed static image; gates are loaded as a
-  sequence.
+  sequence. The ECG gating information of the acquisition is kept on the volumes (`SPECTRecon.Gating*`
+  attributes): accepted R-R window, accepted and rejected beats, heart rate / mean R-R (estimated from the
+  frame time when the scanner leaves it out), frame width, framing and beat rejection settings, and the
+  per-view values when the scanner stores one entry per projection view (Mediso), plus the photopeak
+  projection counts of every gate (`SPECTRecon.GatePhotopeakCounts`), used by the Gated QC step of the
+  Myocardial Perfusion SPECT extension.
 - **Post-filters** (Butterworth, Hann, Gaussian with FWHM in mm) and output count scaling.
 - **Quantification (optional)**: with a calibration factor (cps/MBq) made in the **SPECT Calibration**
   module, the static image is converted to Bq/ml and optionally to SUV:
@@ -66,7 +71,7 @@ DICOMSpectRecon/
   DICOMSpectRecon.py           hidden module that registers the DICOM plugin
   SPECTCalibration.py          calibration module (Nuclear Medicine category)
   DICOMSpectReconLib/
-    nmdata.py                  NM header, energy windows, gating, CT matching
+    nmdata.py                  NM header, energy windows, gating (incl. ECG R-R / beats), CT matching
     reconstruction.py          PyTomography OSEM, count scaling, post-filters
     quantification.py          calibration factors, Bq/ml, SUV, calibration library
     display.py                 in-memory previews
