@@ -424,25 +424,39 @@ def hann3D(image, cutoff):
     return _frequencyFilter3D(image, response)
 
 
-def _cyclesPerCm(image, cutoff):
-    return cutoff * 10.0 / (2.0 * image.GetSpacing()[0])
+def nyquistCyclesPerCm(pixelMm):
+    """Nyquist frequency of a pixel size: 1 / (2 x pixel size), in cycles/cm."""
+    return 10.0 / (2.0 * float(pixelMm))
+
+
+def cutoffFraction(cutoffCm, pixelMm):
+    """(cutoff as a fraction of the Nyquist frequency, clipped to 1, True when it was clipped) of a
+    cutoff given in cycles/cm."""
+    fraction = float(cutoffCm) / nyquistCyclesPerCm(pixelMm)
+    return min(fraction, 1.0), fraction > 1.0
 
 
 def applyFilter(image, params, log):
+    """Post-filter. Butterworth and Hann cutoffs are in cycles/cm, so the same setting smooths the
+    same on every pixel size; they are turned into a Nyquist fraction of this image's pixels."""
     import SimpleITK as sitk
     name = params["filter"]
     if name == "Gaussian":
         sigma = params["fwhm"] / FWHM_PER_SIGMA
         log(f"Applying Gaussian Filter (FWHM: {params['fwhm']:g} mm, sigma {sigma:.2f} mm)...")
         return sitk.SmoothingRecursiveGaussian(image, sigma)
-    if name == "Butterworth":
-        log(f"Applying Butterworth Filter (cutoff: {params['cutoff']:.2f} x Nyquist "
-            f"= {_cyclesPerCm(image, params['cutoff']):.2f} cycles/cm in-plane, order: {params['order']})...")
-        return butterworth3D(image, params["cutoff"], params["order"])
-    if name == "Hann":
-        log(f"Applying Hann Filter (cutoff: {params['cutoff']:.2f} x Nyquist "
-            f"= {_cyclesPerCm(image, params['cutoff']):.2f} cycles/cm in-plane)...")
-        return hann3D(image, params["cutoff"])
+    if name in ("Butterworth", "Hann"):
+        pixel = image.GetSpacing()[0]
+        fraction, clipped = cutoffFraction(params["cutoff"], pixel)
+        text = (f"cutoff: {params['cutoff']:.2f} cycles/cm = {fraction:.2f} x Nyquist "
+                f"(Nyquist {nyquistCyclesPerCm(pixel):.2f} cycles/cm at {pixel:.2f} mm pixels)")
+        if clipped:
+            text += ", limited to the Nyquist frequency"
+        if name == "Butterworth":
+            log(f"Applying Butterworth Filter ({text}, order: {params['order']})...")
+            return butterworth3D(image, fraction, params["order"])
+        log(f"Applying Hann Filter ({text})...")
+        return hann3D(image, fraction)
     log("No post-filter applied.")
     return image
 
@@ -473,7 +487,7 @@ def filterDescription(params):
     if params["filter"] == "Gaussian":
         return f"Gaussian FWHM={params['fwhm']:g} mm"
     if params["filter"] == "Butterworth":
-        return f"Butterworth cutoff={params['cutoff']:.2f} Nyquist, order={params['order']}"
+        return f"Butterworth cutoff={params['cutoff']:.2f} cycles/cm, order={params['order']}"
     if params["filter"] == "Hann":
-        return f"Hann cutoff={params['cutoff']:.2f} Nyquist"
+        return f"Hann cutoff={params['cutoff']:.2f} cycles/cm"
     return "None"

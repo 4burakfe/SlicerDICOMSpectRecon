@@ -116,6 +116,52 @@ def fuse(activitySlice, vmax, ctGraySlice, opacity, windowFraction=WINDOW_FRACTI
 
 
 # ---------------------------------------------------------------------------
+# Bicubic resampling of the scalar slices, before the colours
+# ---------------------------------------------------------------------------
+_cubicCache = {}
+
+
+def _cubicWeights(n, m, a=-0.5):
+    """[m, n] matrix resampling n samples to m with Keys' cubic convolution (bicubic, a = -0.5),
+    pixel centres aligned and edges repeated. Rows sum to 1, so flat regions keep their value."""
+    key = (n, m)
+    if key not in _cubicCache:
+        x = (np.arange(m) + 0.5) * n / m - 0.5
+        base = np.floor(x).astype(int)
+        weights = np.zeros((m, n))
+        rows = np.arange(m)
+        for k in range(-1, 3):
+            d = np.abs(x - (base + k))
+            w = np.where(d <= 1, (a + 2) * d ** 3 - (a + 3) * d ** 2 + 1,
+                         np.where(d < 2, a * d ** 3 - 5 * a * d ** 2 + 8 * a * d - 4 * a, 0.0))
+            np.add.at(weights, (rows, np.clip(base + k, 0, n - 1)), w)
+        _cubicCache[key] = weights
+    return _cubicCache[key]
+
+
+def fitSize(shape, size):
+    """(height, width) of a [h, w] slice scaled to fit size x size, keeping its aspect ratio."""
+    h, w = shape[0], shape[1]
+    scale = float(size) / max(h, w)
+    return max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+
+
+def resampleCubic(arr, size, minimum=None, maximum=None):
+    """Scalar slice resampled to fit size x size with bicubic interpolation, so the preview is
+    interpolated in the data and only then coloured (Qt's smooth scaling would blend the colours).
+    The overshoot of the cubic kernel is clipped to [minimum, maximum] when given."""
+    arr = np.asarray(arr, dtype=np.float64)
+    height, width = fitSize(arr.shape, size)
+    if (height, width) == arr.shape[:2]:
+        out = arr
+    else:
+        out = _cubicWeights(arr.shape[0], height) @ arr @ _cubicWeights(arr.shape[1], width).T
+    if minimum is not None or maximum is not None:
+        out = np.clip(out, minimum, maximum)
+    return out.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # RGB array -> QPixmap
 # ---------------------------------------------------------------------------
 def ppmBytes(rgb):

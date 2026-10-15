@@ -13,7 +13,7 @@ import slicer
 from .nmdata import (adjacentScatterWindows, cleanCtFiles, defaultPeakIndex, describeTiming,
                      readAcquisitionInfo, readGatingInfo, readNmInfo, scatterWindowProblem)
 from .reconstruction import (SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
-                             applyFilter, autoScatterWeight, filterDescription, pytomographyVersion,
+                             applyFilter, autoScatterWeight, cutoffFraction, filterDescription, pytomographyVersion,
                              scaleCounts, scatterDescription)
 from . import display
 from . import quantification as quant
@@ -261,6 +261,7 @@ class SpectReconDialog:
                 self.gatingInfo = readGatingInfo(inputDcm)
             except Exception:
                 logging.warning("Could not read the gating information:\n" + traceback.format_exc())
+        self.pixelMm = self._projectionPixelMm()  # the reconstruction keeps the projection pixel size
         self.calibrations = []
         self.quantLocked = False
         self.units = "counts"
@@ -268,6 +269,16 @@ class SpectReconDialog:
         self.viewSize = self._computeViewSize()
         self.renderer = display.PixmapRenderer(self.viewSize)
         self._buildUI(title)
+
+    def _projectionPixelMm(self):
+        try:
+            import pydicom
+            ds = pydicom.dcmread(self.inputDcm, stop_before_pixels=True)
+            value = float(ds.PixelSpacing[0])
+            return value if value > 0 else None
+        except Exception:
+            logging.warning("Could not read the projection pixel size:\n" + traceback.format_exc())
+            return None
 
     def _availableScreenSize(self):
         """Usable screen area, across Qt versions."""
@@ -441,15 +452,23 @@ class SpectReconDialog:
         self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
         self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 10.0, " mm", FWHM_TOOLTIP)
-        self.cutoffSpin = _slider(0.05, 1.0, 0.01, 2, 0.45, " x Nyq",
-                                  "Butterworth: conventional SPECT 0.4-0.5 x Nyquist; lower (~0.2-0.3) for "
-                                  "low-count studies.\nHann: the response reaches zero at the cutoff, so it "
-                                  "smooths more than Butterworth at the same value.")
+        self.cutoffSpin = _slider(0.05, 1.5, 0.01, 2, 0.45, " cycles/cm",
+                                  "Cutoff in cycles/cm, so it smooths the same whatever the pixel size; it is "
+                                  "limited to the Nyquist frequency, 1 / (2 x pixel size in cm).\n"
+                                  "Butterworth: static perfusion about 0.40-0.52 cycles/cm (vendor defaults: 0.40 rest, "
+                                  "0.52 stress); lower for low-dose or low-count studies.\n"
+                                  "Hann: the response reaches zero at the cutoff, so it smooths more than Butterworth "
+                                  "at the same value.")
+        self.cutoffNyquistLabel = qt.QLabel()
         self.orderSpin = _slider(1, 20, 1, 0, 10, "", "Conventional SPECT: order 5-10")
         for row, (label, widget) in enumerate([("Filter:", self.filterCombo), ("FWHM:", self.fwhmSpin),
-                                               ("Cutoff:", self.cutoffSpin), ("Order:", self.orderSpin)]):
+                                               ("Cutoff:", self.cutoffSpin), ("", self.cutoffNyquistLabel),
+                                               ("Order:", self.orderSpin)]):
             filterForm.addWidget(qt.QLabel(label), row, 0)
             filterForm.addWidget(widget, row, 1)
+        self.cutoffSpin.connect("valueChanged(double)", lambda v: self._showNyquistFraction(self.cutoffSpin,
+                                                                                            self.cutoffNyquistLabel))
+        self._showNyquistFraction(self.cutoffSpin, self.cutoffNyquistLabel)
         self.filterCombo.connect("currentIndexChanged(int)", self.onFilterChanged)
         self.onFilterChanged(self.filterCombo.currentIndex)
         side.addLayout(_row(reconGroup, filterGroup))
@@ -473,14 +492,17 @@ class SpectReconDialog:
             self.gatedFilterCombo.setCurrentIndex(2)
             self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
             self.gatedCutoffSpin = _slider(
-                0.05, 1.0, 0.01, 2, 0.50, " x Nyq",
-                "Gated SPECT: about 0.4-0.5 x Nyquist. Lower cutoffs blur the end-systolic cavity away and "
-                "overestimate the EF (beating phantom: EF stable from 0.5-0.6, EF 91 % instead of 69 % at 0.2; Duarte et al., J Nucl Med Technol 2012)")
+                0.05, 1.5, 0.01, 2, 0.40, " cycles/cm",
+                "Gated SPECT: about 0.40 cycles/cm (vendor default). Lower cutoffs blur the end-systolic cavity "
+                "away and overestimate the EF (beating phantom: EF stable from 0.5-0.6 x Nyquist, EF 91 % instead "
+                "of 69 % at 0.2 x Nyquist; Duarte et al., J Nucl Med Technol 2012)")
+            self.gatedCutoffNyquistLabel = qt.QLabel()
             self.gatedOrderSpin = _slider(1, 20, 1, 0, 10)
             gatedForm.addWidget(self.gatedEnableCheckBox, 0, 0, 1, 2)
             left = [("Iterations:", self.gatedItersSpin), ("Subsets:", self.gatedSubsetsSpin)]
             right = [("Filter:", self.gatedFilterCombo), ("FWHM:", self.gatedFwhmSpin),
-                     ("Cutoff:", self.gatedCutoffSpin), ("Order:", self.gatedOrderSpin)]
+                     ("Cutoff:", self.gatedCutoffSpin), ("", self.gatedCutoffNyquistLabel),
+                     ("Order:", self.gatedOrderSpin)]
             for row, (label, widget) in enumerate(left):
                 gatedForm.addWidget(qt.QLabel(label), row + 1, 0)
                 gatedForm.addWidget(widget, row + 1, 1)
@@ -489,6 +511,9 @@ class SpectReconDialog:
                 gatedForm.addWidget(widget, row, 3)
             gatedForm.setColumnStretch(1, 1)
             gatedForm.setColumnStretch(3, 1)
+            self.gatedCutoffSpin.connect("valueChanged(double)", lambda v: self._showNyquistFraction(
+                self.gatedCutoffSpin, self.gatedCutoffNyquistLabel))
+            self._showNyquistFraction(self.gatedCutoffSpin, self.gatedCutoffNyquistLabel)
             self.gatedFilterCombo.connect("currentIndexChanged(int)", self.onGatedFilterChanged)
             self.onGatedFilterChanged(self.gatedFilterCombo.currentIndex)
 
@@ -1272,12 +1297,23 @@ class SpectReconDialog:
         self.fwhmSpin.setEnabled(name == "Gaussian")
         self.cutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.orderSpin.setEnabled(name == "Butterworth")
+        self.cutoffNyquistLabel.setEnabled(name in ("Butterworth", "Hann"))
 
     def onGatedFilterChanged(self, index):
         name = self.gatedFilterCombo.currentText
         self.gatedFwhmSpin.setEnabled(name == "Gaussian")
         self.gatedCutoffSpin.setEnabled(name in ("Butterworth", "Hann"))
         self.gatedOrderSpin.setEnabled(name == "Butterworth")
+        self.gatedCutoffNyquistLabel.setEnabled(name in ("Butterworth", "Hann"))
+
+    def _showNyquistFraction(self, slider, label):
+        """What a cutoff in cycles/cm is on this study's pixels."""
+        if not self.pixelMm:
+            label.setText("")
+            return
+        fraction, clipped = cutoffFraction(slider.value, self.pixelMm)
+        text = f"= {fraction:.2f} x Nyquist ({self.pixelMm:.2f} mm pixels)"
+        label.setText(text + (", limited to Nyquist" if clipped else ""))
 
     def log(self, message):
         logging.info(message)
@@ -1731,9 +1767,13 @@ class SpectReconDialog:
         if self.reconArray is None:
             return
         sl = self.reconArray[index]
-        self.reconView.setPixmap(self.renderer.toPixmap(display.colorize(sl, self.reconMax, self._petColors())))
+        self.reconView.setPixmap(self.renderer.toPixmap(display.colorize(self._fit(sl), self.reconMax, self._petColors())))
         self.reconInfo.setText(f"Slice {index + 1} / {self.reconArray.shape[0]}   |   slice sum: {sl.sum():.0f}")
         self.updateSliceViews(index)
+
+    def _fit(self, arr, maximum=None):
+        """Slice resampled bicubically to the preview size (counts and CT stay >= 0)."""
+        return display.resampleCubic(arr, self.viewSize, 0.0, maximum)
 
     def updateSliceViews(self, index):
         self.updateFusionAndCtViews(index)
@@ -1784,11 +1824,12 @@ class SpectReconDialog:
             self.ctPanel.setVisible(False)
             return
 
-        self.ctView.setPixmap(self.renderer.toPixmap(display.grayscale(ctGray, 1.0)))
+        ctGrayFit = self._fit(ctGray, maximum=1.0)
+        self.ctView.setPixmap(self.renderer.toPixmap(display.grayscale(ctGrayFit, 1.0)))
         self.ctInfo.setText(f"Slice {index + 1} / {self.reconArray.shape[0]}   |   "
                             f"HU range: {ctSlice.min():.0f} to {ctSlice.max():.0f}")
 
-        fused = display.fuse(self.reconArray[index], self.reconMax, ctGray, self._opacity())
+        fused = display.fuse(self._fit(self.reconArray[index]), self.reconMax, ctGrayFit, self._opacity())
         self.fusionView.setPixmap(self.renderer.toPixmap(fused))
         self.fusionInfo.setText(f"Slice {index + 1}   |   opacity {self.opacitySlider.value}%")
 
@@ -1799,13 +1840,14 @@ class SpectReconDialog:
         if index >= gateArray.shape[0]:
             return
         gateSlice = gateArray[index]
+        gateSlice = self._fit(gateSlice)
         self.gatedView.setPixmap(self.renderer.toPixmap(display.colorize(gateSlice, self.gateMax, self._petColors())))
         self.gatedInfo.setText(f"Gate {self.gateIndex + 1} / {len(self.gateArrays)}   |   "
                                f"slice {index + 1} / {gateArray.shape[0]}")
         if self.ctFiles:
             ctGray, _ = self._ctGraySlice(index)
             if ctGray is not None:
-                fused = display.fuse(gateSlice, self.gateMax, ctGray, self._opacity())
+                fused = display.fuse(gateSlice, self.gateMax, self._fit(ctGray, maximum=1.0), self._opacity())
                 self.gatedFusionView.setPixmap(self.renderer.toPixmap(fused))
                 self.gatedFusionInfo.setText(f"Gate {self.gateIndex + 1}   |   slice {index + 1}")
 
@@ -1861,7 +1903,7 @@ class SpectReconDialog:
     def updateProjView(self, index):
         if self.projArray is None:
             return
-        self.projView.setPixmap(self.renderer.toPixmap(display.grayscale(self.projArray[index], self.projMax)))
+        self.projView.setPixmap(self.renderer.toPixmap(display.grayscale(self._fit(self.projArray[index]), self.projMax)))
         text = f"Projection {index + 1} / {self.projArray.shape[0]}"
         if self.projDetectors is not None:
             text += f"   |   Detector {int(self.projDetectors[index])}"
