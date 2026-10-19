@@ -493,7 +493,7 @@ class SpectReconDialog:
             self.gatedFilterCombo.setCurrentIndex(2)
             self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
             self.gatedCutoffSpin = _slider(
-                0.05, 1.5, 0.01, 2, 0.40, " cycles/cm",
+                0.05, 1.5, 0.01, 2, 0.35, " cycles/cm",
                 "Gated SPECT: about 0.40 cycles/cm (vendor default). Lower cutoffs blur the end-systolic cavity "
                 "away and overestimate the EF (beating phantom: EF stable from 0.5-0.6 x Nyquist, EF 91 % instead "
                 "of 69 % at 0.2 x Nyquist; Duarte et al., J Nucl Med Technol 2012)")
