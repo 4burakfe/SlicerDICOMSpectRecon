@@ -223,6 +223,7 @@ class SpectReconDialog:
         self.gateRawImages = []      # unfiltered per-gate recons in native units (cached)
         self.gateRawStats = []
         self.gateImages = []         # scaled + filtered per-gate recons, handed to Slicer
+        self.gateInfos = []          # SPECTRecon.* attributes of each gate (its own recon settings)
         self.gateArrays = []
         self.gateMax = 1.0
         self.gateReconKey = None
@@ -1512,6 +1513,7 @@ class SpectReconDialog:
                 self.logic.cleanup()
         if result != qt.QDialog.Accepted or self.filteredImage is None:
             self.gateImages = []
+            self.gateInfos = []
             return None, None
         return self.filteredImage, self.info
 
@@ -1614,7 +1616,7 @@ class SpectReconDialog:
             sp = self.filteredImage.GetSpacing()
             self.log(f"Voxel spacing (mm): {sp[0]:.2f} x {sp[1]:.2f} x {sp[2]:.2f}  |  Static preview updated.")
 
-            self._applyGates(params, scatter)
+            self._applyGates(params, scatter, staticOnlyKeys=set(quantInfo) | {"StaticFrom"})
             self.appliedParams = params
             self.lastRunFailed = False
             return True
@@ -1632,10 +1634,11 @@ class SpectReconDialog:
         finally:
             self._setBusy(False)
 
-    def _applyGates(self, params, scatter):
+    def _applyGates(self, params, scatter, staticOnlyKeys=()):
         import SimpleITK as sitk
         if not (self.isGated and params.get("gated")):
             self.gateImages = []
+            self.gateInfos = []
             self.gateArrays = []
             self.stopGateCine()
             if self.isGated:
@@ -1646,6 +1649,7 @@ class SpectReconDialog:
         if not self.gateRawImages or gateKey != self.gateReconKey:
             # Never hand stale gates to Slicer if this run fails half way
             self.gateImages = []
+            self.gateInfos = []
             images, stats = [], []
             for i, gate in enumerate(self.gateNumbers):
                 self.log(f"--- Gate {gate} ({i + 1} / {self.nGates}) ---")
@@ -1661,8 +1665,9 @@ class SpectReconDialog:
             self.log("Gated OSEM settings unchanged - re-scaling/re-filtering existing gate reconstructions.")
 
         gatedFilter = self.filterParams(params, gated=True)
-        self.gateImages = [applyFilter(scaleCounts(image, stats, params["scaling"])[0], gatedFilter, self.log)
-                           for image, stats in zip(self.gateRawImages, self.gateRawStats)]
+        scaled = [scaleCounts(image, stats, params["scaling"])
+                  for image, stats in zip(self.gateRawImages, self.gateRawStats)]
+        self.gateImages = [applyFilter(image, gatedFilter, self.log) for image, _, _ in scaled]
         self.gateArrays = [sitk.GetArrayFromImage(image) for image in self.gateImages]
         self.gateMax = max((display.displayReference(a) for a in self.gateArrays if a.size), default=1.0)
         self.gateIndex = min(self.gateIndex, len(self.gateArrays) - 1)
@@ -1677,9 +1682,31 @@ class SpectReconDialog:
             # A gate's counting time is not the acquisition duration, so gates are not converted
             self.info["GatedUnits"] = "acquisition counts (not quantified)"
             self.log("Note: gates stay in acquisition counts; only the static image is quantified.")
+        self.gateInfos = [self._gateInfo(params, gatedFilter, stats, factor, staticOnlyKeys)
+                          for (_, factor, _), stats in zip(scaled, self.gateRawStats)]
         self.updateGatedViews(self.reconSlider.value)
         if self.gateCineCheckBox.checked:
             self.startGateCine()
+
+    def _gateInfo(self, params, gatedFilter, stats, factor, staticOnlyKeys):
+        """SPECTRecon.* attributes of one gate: the shared acquisition/correction fields of the
+        static image, with the gated OSEM, filter, scaling and counts of this gate in place of the
+        static ones. Quantification fields are left out (gates stay in counts)."""
+        info = {k: v for k, v in self.info.items() if k not in staticOnlyKeys}
+        info.update({
+            "Iterations": params["gatedIters"],
+            "Subsets": params["gatedSubsets"],
+            "PostFilter": filterDescription(gatedFilter),
+            "CountScaling": params["scaling"],
+            "CountScalingFactor": f"{factor:.6g}",
+            "Views": stats["nViews"],
+            "PhotopeakCounts": f"{stats['photopeakCounts']:.0f}",
+            "ScatterCounts": f"{stats['scatterCounts']:.0f}",
+            "DataConsistency": "n/a" if stats["consistency"] is None else f"{stats['consistency']:.3f}",
+            "Units": "counts",
+            "ToAcquisitionCounts": f"{stats['nViews'] / factor:.9g}",
+        })
+        return info
 
     def _isUpToDate(self):
         """The preview (what Load would hand to Slicer) was made with the current settings."""
