@@ -298,14 +298,8 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
 
         gateImages = getattr(dialog, "gateImages", [])
         if gateImages:
-            gateInfo = dict(info)
-            if units != "counts":
-                # Gates are never quantified (their counting time is not the acquisition duration)
-                gateInfo = {k: v for k, v in info.items()
-                            if k not in ("BqPerMlFactor", "SUVType", "SUVMassKg", "InjectedMBqAtScan")}
-                gateInfo.update({"Units": "counts", "CountScaling": "Acquisition counts (x number of views)",
-                                 "ToAcquisitionCounts": "1"})
-            self.loadGatesAsSequence(gateImages, f"{loadable.name} {suffix} gated", gateInfo,
+            # Each gate carries its own (gated) recon settings and counts, never quantified
+            self.loadGatesAsSequence(gateImages, f"{loadable.name} {suffix} gated", dialog.gateInfos,
                                      getattr(dialog, "gateNumbers", None), volumeNode)
 
         # Show and center after the DICOM module has finished its own loading.
@@ -324,8 +318,9 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
 
         return volumeNode
 
-    def loadGatesAsSequence(self, gateImages, name, info, gateNumbers=None, staticNode=None):
-        """Put the per-gate reconstructions in a sequence so Slicer can play them."""
+    def loadGatesAsSequence(self, gateImages, name, gateInfos, gateNumbers=None, staticNode=None):
+        """Put the per-gate reconstructions in a sequence so Slicer can play them.
+        gateInfos holds the SPECTRecon.* attributes of each gate, in gate order."""
         try:
             import sitkUtils
             gateNumbers = list(gateNumbers or range(1, len(gateImages) + 1))
@@ -333,7 +328,7 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
             sequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", baseName)
             sequenceNode.SetIndexName("Gate")
             sequenceNode.SetIndexUnit("")
-            for image, gate in zip(gateImages, gateNumbers):
+            for image, gate, info in zip(gateImages, gateNumbers, gateInfos):
                 gateNode = sitkUtils.PushVolumeToSlicer(image, name=f"{baseName} G{gate}")
                 for key, value in info.items():
                     gateNode.SetAttribute(f"SPECTRecon.{key}", str(value))
