@@ -12,7 +12,8 @@ import slicer
 
 from .nmdata import (adjacentScatterWindows, cleanCtFiles, defaultPeakIndex, describeTiming,
                      readAcquisitionInfo, readGatingInfo, readNmInfo, scatterWindowProblem)
-from .reconstruction import (ALGORITHM_FBP, ALGORITHM_OSEM, ALGORITHMS, FBP_WINDOWS, FBP_WINDOWS_WITH_ORDER,
+from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, ALGORITHM_OSEM, ALGORITHMS, FBP_WINDOWS,
+                             FBP_WINDOWS_WITH_ORDER, ITERATIVE_ALGORITHMS, bsremDescription,
                              SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
                              applyFilter, autoScatterWeight, cutoffFraction, fbpDescription, filterDescription,
                              pytomographyVersion, scaleCounts, scatterDescription)
@@ -440,7 +441,12 @@ class SpectReconDialog:
         self.algorithmCombo.setItemData(0, "Ordered subset expectation maximisation (iterative, Poisson "
                                            "noise model, attenuation and scatter in the system model)",
                                         qt.Qt.ToolTipRole)
-        self.algorithmCombo.setItemData(1, "Filtered backprojection (analytic): ramp filter with a window, "
+        self.algorithmCombo.setItemData(1, "Block sequential regularised EM: OSEM-like updates with a relative "
+                                           "difference prior and a decreasing step, so it converges. The prior "
+                                           "strength (beta) sets the noise, not the iteration count, and no "
+                                           "post-filter is needed (it is switched off when BSREM is chosen). "
+                                           "Starts from one OSEM iteration, like Q.Clear.", qt.Qt.ToolTipRole)
+        self.algorithmCombo.setItemData(2, "Filtered backprojection (analytic): ramp filter with a window, "
                                            "scatter subtracted from the projections, Chang attenuation "
                                            "correction. The window does the smoothing, so the post-filter "
                                            "is switched off when FBP is chosen.", qt.Qt.ToolTipRole)
@@ -452,6 +458,17 @@ class SpectReconDialog:
         self.subsetsSpin.setRange(1, 128)
         self.subsetsSpin.setValue(6)
         self.subsetsSpin.setToolTip("Best if it divides the number of projection angles (e.g. 6 or 10 for 60 views)")
+        self.bsremItersSpin = qt.QSpinBox()
+        self.bsremItersSpin.setRange(1, 200)
+        self.bsremItersSpin.setValue(20)
+        self.bsremItersSpin.setToolTip("BSREM converges, so more iterations stop changing the image; "
+                                       "15-30 is usual")
+        self.bsremBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.3, "",
+                                     "Prior strength beta: higher is smoother (less noise, slightly less "
+                                     "contrast in small hot spots). 0 is unregularised (converges towards MLEM).")
+        self.bsremGammaSpin = _slider(0.0, 10.0, 0.1, 1, 2.0, "",
+                                      "Relative difference prior gamma: higher keeps edges sharper "
+                                      "(penalises large differences less). 2 is a common choice.")
         self.fbpWindowCombo = qt.QComboBox()
         self.fbpWindowCombo.addItems(FBP_WINDOWS)
         self.fbpWindowCombo.setCurrentIndex(FBP_WINDOWS.index("Butterworth"))
@@ -467,14 +484,16 @@ class SpectReconDialog:
         self.reconRows = {}
         for row, (key, label, widget) in enumerate([
                 ("algorithm", "Algorithm:", self.algorithmCombo),
-                ("osem", "Iterations:", self.itersSpin), ("osem", "Subsets:", self.subsetsSpin),
+                ("osem", "Iterations:", self.itersSpin), ("bsrem", "Iterations:", self.bsremItersSpin),
+                ("subsets", "Subsets:", self.subsetsSpin),
+                ("bsrem", "Beta:", self.bsremBetaSpin), ("bsrem", "Gamma:", self.bsremGammaSpin),
                 ("fbp", "Window:", self.fbpWindowCombo), ("fbp", "Cutoff:", self.fbpCutoffSpin),
                 ("fbp", "", self.fbpCutoffNyquistLabel), ("fbpOrder", "Order:", self.fbpOrderSpin)]):
             labelWidget = qt.QLabel(label)
             reconForm.addWidget(labelWidget, row, 0)
             reconForm.addWidget(widget, row, 1)
             self.reconRows.setdefault(key, []).extend([labelWidget, widget])
-        reconForm.setRowStretch(7, 1)
+        reconForm.setRowStretch(10, 1)
         self.fbpCutoffSpin.connect("valueChanged(double)", lambda v: self._showNyquistFraction(
             self.fbpCutoffSpin, self.fbpCutoffNyquistLabel))
         self._showNyquistFraction(self.fbpCutoffSpin, self.fbpCutoffNyquistLabel)
@@ -520,7 +539,7 @@ class SpectReconDialog:
             self.gatedSubsetsSpin = qt.QSpinBox()
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
-            self.gatedSubsetsSpin.setToolTip("OSEM only; with FBP the gates use the static FBP window")
+            self.gatedSubsetsSpin.setToolTip("OSEM only; with BSREM or FBP the gates use the static settings")
             self.gatedFilterCombo = qt.QComboBox()
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
@@ -903,7 +922,7 @@ class SpectReconDialog:
         calibratedAlgorithm = recon.get("algorithm") or ALGORITHM_OSEM
         if calibratedAlgorithm != self.algorithmCombo.currentText:
             warnings.append(f"calibrated with {calibratedAlgorithm}, current {self.algorithmCombo.currentText}")
-        elif recon.get("iterations") and (recon.get("iterations"), recon.get("subsets")) != \
+        elif calibratedAlgorithm == ALGORITHM_OSEM and recon.get("iterations") and (recon.get("iterations"), recon.get("subsets")) != \
                 (self.itersSpin.value, self.subsetsSpin.value):
             warnings.append(f"calibrated with {recon.get('iterations')} iterations x {recon.get('subsets')} "
                             f"subsets, current {self.itersSpin.value} x {self.subsetsSpin.value}")
@@ -1029,8 +1048,8 @@ class SpectReconDialog:
             "ScatterLowerRange": energyRange(params["indexLower"]) if params["indexLower"] is not None else "",
             "ScatterUpperRange": energyRange(params["indexUpper"]) if params["indexUpper"] is not None else "",
             "ReconAlgorithm": params["algorithm"],
-            "ReconIterations": params["iters"] if params["algorithm"] == ALGORITHM_OSEM else "",
-            "ReconSubsets": params["subsets"] if params["algorithm"] == ALGORITHM_OSEM else "",
+            "ReconIterations": self.reconIterations(params)[0] or "",
+            "ReconSubsets": self.reconIterations(params)[1] or "",
         }
 
     def _resizeDialog(self):
@@ -1350,9 +1369,9 @@ class SpectReconDialog:
         self.gatedCutoffNyquistLabel.setEnabled(name in ("Butterworth", "Hann"))
 
     def onAlgorithmChanged(self, index):
-        """FBP smooths with its own window, so the post-filters are switched off for it (and put
-        back when going back to OSEM)."""
-        fbp = self.algorithmCombo.currentText == ALGORITHM_FBP
+        """FBP smooths with its own window and BSREM with its prior, so the post-filters are switched
+        off for them (and put back when going back to OSEM)."""
+        fbp = self.algorithmCombo.currentText != ALGORITHM_OSEM
         combos = [self.filterCombo] + ([self.gatedFilterCombo] if self.isGated else [])
         if fbp and self.postFilterBeforeFbp is None:
             self.postFilterBeforeFbp = [combo.currentIndex for combo in combos]
@@ -1360,20 +1379,22 @@ class SpectReconDialog:
                 combo.setCurrentIndex(combo.findText("None"))
         elif not fbp and self.postFilterBeforeFbp is not None:
             for combo, previous in zip(combos, self.postFilterBeforeFbp):
-                if combo.currentText == "None":  # leave a filter the user picked for FBP alone
+                if combo.currentText == "None":  # leave a filter the user picked alone
                     combo.setCurrentIndex(previous)
             self.postFilterBeforeFbp = None
         self._updateAlgorithmRows()
 
     def _updateAlgorithmRows(self):
-        fbp = self.algorithmCombo.currentText == ALGORITHM_FBP
-        for key, visible in (("osem", not fbp), ("fbp", fbp),
+        algorithm = self.algorithmCombo.currentText
+        fbp = algorithm == ALGORITHM_FBP
+        for key, visible in (("osem", algorithm == ALGORITHM_OSEM), ("bsrem", algorithm == ALGORITHM_BSREM),
+                             ("subsets", algorithm in ITERATIVE_ALGORITHMS), ("fbp", fbp),
                              ("fbpOrder", fbp and self.fbpWindowCombo.currentText in FBP_WINDOWS_WITH_ORDER)):
             for widget in self.reconRows[key]:
                 widget.setVisible(visible)
         if self.isGated:
-            self.gatedItersSpin.setEnabled(not fbp)
-            self.gatedSubsetsSpin.setEnabled(not fbp)
+            self.gatedItersSpin.setEnabled(algorithm == ALGORITHM_OSEM)
+            self.gatedSubsetsSpin.setEnabled(algorithm == ALGORITHM_OSEM)
 
     def _showNyquistFraction(self, slider, label):
         """What a cutoff in cycles/cm is on this study's pixels."""
@@ -1396,6 +1417,8 @@ class SpectReconDialog:
             "algorithm": self.algorithmCombo.currentText,
             "iters": self.itersSpin.value,
             "subsets": self.subsetsSpin.value,
+            "bsrem": {"iters": self.bsremItersSpin.value, "beta": round(self.bsremBetaSpin.value, 4),
+                      "gamma": round(self.bsremGammaSpin.value, 4)},
             "fbp": {"window": self.fbpWindowCombo.currentText, "cutoff": self.fbpCutoffSpin.value,
                     "order": int(round(self.fbpOrderSpin.value))},
             "attenuationCorrection": bool(self.acCheckBox.checked) and bool(self.ctFiles),
@@ -1453,7 +1476,17 @@ class SpectReconDialog:
         return (params["indexLower"], params["indexUpper"], params.get("scatterWeight"))
 
     @staticmethod
-    def reconKeyFor(params, gated=False):
+    def reconIterations(params, gated=False):
+        """(iterations, subsets) of the static or gated reconstruction; (None, None) for FBP.
+        BSREM gates use the static BSREM settings."""
+        if params["algorithm"] == ALGORITHM_OSEM:
+            return (params["gatedIters"], params["gatedSubsets"]) if gated else (params["iters"], params["subsets"])
+        if params["algorithm"] == ALGORITHM_BSREM:
+            return params["bsrem"]["iters"], params["subsets"]
+        return None, None
+
+    @classmethod
+    def reconKeyFor(cls, params, gated=False):
         """Everything that changes the reconstruction result (not post-filtering or count scaling).
         The CT identity is part of the key when attenuation correction is on."""
         prefix = "gated" if gated else ""
@@ -1462,7 +1495,9 @@ class SpectReconDialog:
             settings = (fbp["window"], fbp["cutoff"],
                         fbp["order"] if fbp["window"] in FBP_WINDOWS_WITH_ORDER else None)
         else:
-            settings = (params["gatedIters"], params["gatedSubsets"]) if gated else (params["iters"], params["subsets"])
+            settings = cls.reconIterations(params, gated)
+            if params["algorithm"] == ALGORITHM_BSREM:
+                settings += (params["bsrem"]["beta"], params["bsrem"]["gamma"])
         ctId = params["ctId"] if params["attenuationCorrection"] else None
         return (params["algorithm"], settings, params["attenuationCorrection"], ctId, params["indexPeak"],
                 params["indexLower"], params["indexUpper"], params.get("scatterWeight"), prefix)
@@ -1598,7 +1633,7 @@ class SpectReconDialog:
         problem = self.scatterProblem(params)
         if problem:
             raise ValueError(f"Scatter correction: {problem}")
-        if self.logic is not None and params["algorithm"] == ALGORITHM_OSEM:
+        if self.logic is not None and params["algorithm"] in ITERATIVE_ALGORITHMS:
             nViews = self.logic.nViews
             for spin, key in ((self.subsetsSpin, "subsets"),
                               (getattr(self, "gatedSubsetsSpin", None), "gatedSubsets")):
@@ -1611,7 +1646,7 @@ class SpectReconDialog:
                     spin.setValue(nViews)
             for iters, subsets, what in ((params["iters"], params["subsets"], "static"),
                                          (params.get("gatedIters"), params.get("gatedSubsets"), "gated")):
-                if iters and subsets and iters * subsets > 120:
+                if params["algorithm"] == ALGORITHM_OSEM and iters and subsets and iters * subsets > 120:
                     self.log(f"Note: {iters} x {subsets} = {iters * subsets} subset updates ({what}) - "
                              "images will be noisy and slow; 2-4 iterations with 6-10 subsets is usual.")
         return params
@@ -1643,9 +1678,10 @@ class SpectReconDialog:
             scatter = self.scatterArgument(params)
             key = self.reconKeyFor(params)
             if self.reconImage is None or key != self.reconKey:
+                iters, subsets = self.reconIterations(params)
                 self.reconImage, self.reconStats = self.logic.reconstruct(
-                    params["iters"], params["subsets"], params["attenuationCorrection"], scatter,
-                    algorithm=params["algorithm"], fbp=params["fbp"])
+                    iters, subsets, params["attenuationCorrection"], scatter,
+                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"])
                 self.reconKey = key
             else:
                 self.log("Static reconstruction settings unchanged - re-scaling/re-filtering existing reconstruction.")
@@ -1660,8 +1696,8 @@ class SpectReconDialog:
             stats = self.reconStats
             self.info = {
                 "Algorithm": params["algorithm"],
-                "Iterations": params["iters"] if params["algorithm"] == ALGORITHM_OSEM else "n/a",
-                "Subsets": params["subsets"] if params["algorithm"] == ALGORITHM_OSEM else "n/a",
+                "Iterations": self.reconIterations(params)[0] or "n/a",
+                "Subsets": self.reconIterations(params)[1] or "n/a",
                 "AttenuationCorrection": "CT" if params["attenuationCorrection"] else "None",
                 "ScatterCorrection": scatterDescription(params),
                 "PhotopeakWindow": self.energyWindows[params["indexPeak"]]["label"]
@@ -1679,6 +1715,8 @@ class SpectReconDialog:
                 # Multiply voxel values by this to get acquisition counts (used by SPECT Calibration)
                 "ToAcquisitionCounts": f"{stats['nViews'] / factor:.9g}" if units == "counts" else "n/a",
             }
+            if params["algorithm"] == ALGORITHM_BSREM:
+                self.info["Prior"] = bsremDescription(params["bsrem"])
             if params["algorithm"] == ALGORITHM_FBP:
                 self.info["FBPFilter"] = fbpDescription(params["fbp"])
                 if params["attenuationCorrection"]:
@@ -1734,10 +1772,10 @@ class SpectReconDialog:
             for i, gate in enumerate(self.gateNumbers):
                 self.log(f"--- Gate {gate} ({i + 1} / {self.nGates}) ---")
                 projectionSet = self.logic.gateSet(gate)
+                iters, subsets = self.reconIterations(params, gated=True)
                 image, gateStats = self.logic.reconstruct(
-                    params["gatedIters"], params["gatedSubsets"],
-                    params["attenuationCorrection"], scatter, projectionSet=projectionSet,
-                    algorithm=params["algorithm"], fbp=params["fbp"])
+                    iters, subsets, params["attenuationCorrection"], scatter, projectionSet=projectionSet,
+                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"])
                 images.append(image)
                 stats.append(gateStats)
             self.gateRawImages, self.gateRawStats = images, stats
@@ -1756,9 +1794,9 @@ class SpectReconDialog:
         # Photopeak projection counts of every gate: equal counts mean the beats filled all gates
         self.info["GatePhotopeakCounts"] = json.dumps(
             [round(float(stats.get("photopeakCounts") or 0.0)) for stats in self.gateRawStats])
-        fbp = params["algorithm"] == ALGORITHM_FBP
-        self.info["GatedIterations"] = "n/a" if fbp else params["gatedIters"]
-        self.info["GatedSubsets"] = "n/a" if fbp else params["gatedSubsets"]
+        gatedIters, gatedSubsets = self.reconIterations(params, gated=True)
+        self.info["GatedIterations"] = gatedIters or "n/a"
+        self.info["GatedSubsets"] = gatedSubsets or "n/a"
         self.info["GatedPostFilter"] = filterDescription(gatedFilter)
         if params.get("quant"):
             # A gate's counting time is not the acquisition duration, so gates are not converted
@@ -1775,10 +1813,10 @@ class SpectReconDialog:
         static image, with the gated iterations, filter, scaling and counts of this gate in place of the
         static ones. Quantification fields are left out (gates stay in counts)."""
         info = {k: v for k, v in self.info.items() if k not in staticOnlyKeys}
-        fbp = params["algorithm"] == ALGORITHM_FBP
+        gatedIters, gatedSubsets = self.reconIterations(params, gated=True)
         info.update({
-            "Iterations": "n/a" if fbp else params["gatedIters"],
-            "Subsets": "n/a" if fbp else params["gatedSubsets"],
+            "Iterations": gatedIters or "n/a",
+            "Subsets": gatedSubsets or "n/a",
             "PostFilter": filterDescription(gatedFilter),
             "CountScaling": params["scaling"],
             "CountScalingFactor": f"{factor:.6g}",
@@ -1818,7 +1856,8 @@ class SpectReconDialog:
 
     def _watchSettings(self):
         """Re-check the Load state whenever any setting in the side panel changes."""
-        watched = [self.algorithmCombo, self.itersSpin, self.subsetsSpin, self.fbpWindowCombo,
+        watched = [self.algorithmCombo, self.itersSpin, self.subsetsSpin, self.bsremItersSpin,
+                   self.bsremBetaSpin, self.bsremGammaSpin, self.fbpWindowCombo,
                    self.fbpCutoffSpin, self.fbpOrderSpin, self.filterCombo, self.fwhmSpin, self.cutoffSpin,
                    self.orderSpin, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
                    self.peakCombo, self.lowerCombo, self.upperCombo, self.scatterWeightSpin,

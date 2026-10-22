@@ -1,4 +1,4 @@
-"""OSEM and FBP reconstruction with PyTomography, output count scaling and post-filters.
+"""OSEM, BSREM and FBP reconstruction with PyTomography, output count scaling and post-filters.
 
 No Slicer dependency. torch, pytomography and SimpleITK are imported when used, so
 importing this module is cheap (it is imported when Slicer starts).
@@ -26,8 +26,15 @@ CT_COVERAGE_WARNING = 0.9      # fraction of SPECT slices that should contain ti
 MU_MAX_PLAUSIBLE = 0.6         # /cm; far above bone at SPECT energies
 
 ALGORITHM_OSEM = "OSEM"
+ALGORITHM_BSREM = "BSREM"
 ALGORITHM_FBP = "FBP"
-ALGORITHMS = [ALGORITHM_OSEM, ALGORITHM_FBP]
+ALGORITHMS = [ALGORITHM_OSEM, ALGORITHM_BSREM, ALGORITHM_FBP]
+ITERATIVE_ALGORITHMS = (ALGORITHM_OSEM, ALGORITHM_BSREM)
+
+# BSREM: OSEM iterations used as the starting image (as in Q.Clear), and the relaxation sequence
+# alpha(n) = 1 / (1 + n / BSREM_RELAXATION_ITERATIONS), which makes the iterations converge
+BSREM_WARM_START_ITERATIONS = 1
+BSREM_RELAXATION_ITERATIONS = 10.0
 
 # FBP windows multiplied onto the ramp. Each is a function of f and the cutoff fc, both as a
 # fraction of the Nyquist frequency.
@@ -97,8 +104,10 @@ class _OsemMonitor:
     """PyTomography callback: reports progress after every subset and aborts on request.
     Duck-typed (run/finalize) so it works across PyTomography 3.x callback signatures."""
 
-    def __init__(self, label, nIters, nSubsets, progress=None, shouldAbort=None):
+    def __init__(self, label, nIters, nSubsets, progress=None, shouldAbort=None, done=0, total=None):
         self.label = label
+        self.offset = done  # subset updates already reported (BSREM warm start)
+        self.overall = total
         self.total = max(1, nIters * nSubsets)
         self.nSubsets = max(1, nSubsets)
         self.nIters = nIters
@@ -108,7 +117,7 @@ class _OsemMonitor:
     def run(self, object, n_iter=0, n_subset=0, *args, **kwargs):
         if self.progress is not None:
             done = n_iter * self.nSubsets + n_subset + 1
-            self.progress(self.label, done, self.total,
+            self.progress(self.label, self.offset + done, self.overall or self.total,
                           f"{self.label}: iteration {n_iter + 1}/{self.nIters}, "
                           f"subset {n_subset + 1}/{self.nSubsets}")
         if self.shouldAbort is not None and self.shouldAbort():
@@ -334,10 +343,12 @@ class SpectReconLogic:
                      "(metal, contrast or a CT that is not in HU?).")
 
     def reconstruct(self, iters, subsets, useAttenuationCorrection=False,
-                    scatter=None, projectionSet=None, algorithm=ALGORITHM_OSEM, fbp=None):
+                    scatter=None, projectionSet=None, algorithm=ALGORITHM_OSEM, fbp=None, bsrem=None):
         """OSEM or FBP reconstruction in PyTomography's native units (counts per voxel per view).
         scatter: None, or (indexLower, indexUpper[, weight]) with indexUpper possibly None (dual
         window) and weight None (automatic) or a manual dual window scatter weight.
+        bsrem (BSREM only): {"beta", "gamma"} of the relative difference prior; iters and subsets are
+        the BSREM ones.
         fbp (FBP only): {"window", "cutoff" (cycles/cm), "order"}. FBP subtracts the scatter estimate
         from the projections and corrects attenuation with the first order Chang method.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
@@ -354,11 +365,13 @@ class SpectReconLogic:
             nViews = projectionSet.nViews
             if algorithm not in ALGORITHMS:
                 raise ValueError(f"Unknown reconstruction algorithm '{algorithm}'.")
-            if algorithm == ALGORITHM_OSEM:
+            if algorithm in ITERATIVE_ALGORITHMS:
                 if subsets < 1 or subsets > nViews:
                     raise ValueError(f"{subsets} subsets requested, but there are only {nViews} projection views.")
                 if iters < 1:
-                    raise ValueError("At least one OSEM iteration is needed.")
+                    raise ValueError(f"At least one {algorithm} iteration is needed.")
+                if algorithm == ALGORITHM_BSREM and (not bsrem or float(bsrem.get("beta", -1)) < 0):
+                    raise ValueError("BSREM needs a prior strength (beta) of 0 or more.")
             elif not fbp or fbp.get("window") not in FBP_WINDOWS:
                 raise ValueError("FBP needs a filter window (" + ", ".join(FBP_WINDOWS) + ").")
 
@@ -403,6 +416,9 @@ class SpectReconLogic:
             if algorithm == ALGORITHM_FBP:
                 reconstructed_object = self._reconstructFBP(projectionSet, system_matrix, additive_term,
                                                             useAttenuationCorrection, fbp)
+            elif algorithm == ALGORITHM_BSREM:
+                reconstructed_object = self._reconstructBSREM(projectionSet, system_matrix, additive_term,
+                                                              iters, subsets, bsrem)
             else:
                 self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
                 if subsets > 1 and nViews % subsets != 0:
@@ -469,6 +485,35 @@ class SpectReconLogic:
             if base_temp_dir and os.path.exists(base_temp_dir):
                 shutil.rmtree(base_temp_dir, ignore_errors=True)
 
+
+    def _reconstructBSREM(self, projectionSet, system_matrix, additive_term, iters, subsets, bsrem):
+        """BSREM with a relative difference prior, started from OSEM. The decreasing relaxation makes it
+        converge, so beta (not the iteration count) sets the noise; no post-filter is needed."""
+        from pytomography.likelihoods import PoissonLogLikelihood
+        from pytomography.algorithms import BSREM, OSEM
+        from pytomography.priors import RelativeDifferencePrior
+
+        beta, gamma = float(bsrem["beta"]), float(bsrem.get("gamma", 2.0))
+        nViews = projectionSet.nViews
+        self.log(f"Running BSREM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets}, "
+                 f"relative difference prior beta {beta:g}, gamma {gamma:g})...")
+        if subsets > 1 and nViews % subsets != 0:
+            self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
+        likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections, additive_term=additive_term)
+        warm = BSREM_WARM_START_ITERATIONS
+        total = (warm + iters) * subsets
+        self.log(f"  -> Starting image: {warm} OSEM iteration(s) x {subsets} subsets")
+        monitor = _OsemMonitor(f"{projectionSet.label} (OSEM start)", warm, subsets,
+                               self.progress, self.shouldAbort, total=total)
+        initial = OSEM(likelihood)(n_iters=warm, n_subsets=subsets, callback=monitor)
+        prior = RelativeDifferencePrior(beta=beta, gamma=gamma) if beta > 0 else None
+        algorithm = BSREM(likelihood, object_initial=initial.clone(), prior=prior,
+                          relaxation_sequence=lambda n: 1.0 / (1.0 + n / BSREM_RELAXATION_ITERATIONS))
+        monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort,
+                               done=warm * subsets, total=total)
+        image = algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
+        self.log("BSREM reconstruction complete.")
+        return image
 
     def _reconstructFBP(self, projectionSet, system_matrix, additive_term, useAttenuationCorrection, fbp):
         """Filtered backprojection of one projection set; negative voxels are set to 0 (the image is
@@ -629,6 +674,10 @@ def autoScatterWeight(peakWidth, lowerWidth):
     if not peakWidth or not lowerWidth or lowerWidth <= 0:
         return None
     return 0.5 * float(peakWidth) / float(lowerWidth)
+
+
+def bsremDescription(bsrem):
+    return f"relative difference prior beta={float(bsrem['beta']):g}, gamma={float(bsrem['gamma']):g}"
 
 
 def fbpDescription(fbp):
