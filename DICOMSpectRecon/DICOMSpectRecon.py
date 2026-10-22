@@ -6,12 +6,16 @@ in the DICOM browser. On Load, opens a preview window:
     left   = gated reconstruction in cine, and its CT fusion (gated studies only)
     middle = static reconstruction (summed gate counts when gated), and its CT fusion
     right  = raw projections in cine, and the CT resampled to the SPECT grid
-    side   = OSEM iterations/subsets (separately for static and gated), CT attenuation
+    side   = OSEM iterations/subsets (separately for static and gated), BSREM iterations/
+             subsets/prior, or FBP filter window/cutoff, CT attenuation
              correction, dual/triple energy window scatter correction, output count
              scaling, and post-filters
 
 Reconstruction logic is taken from the standalone PyTomography app
-(OSEM, save_dcm -> SimpleITK read, filters). Output count scaling is optional:
+(OSEM, save_dcm -> SimpleITK read, filters). BSREM is OSEM-like with a relative difference prior and a decreasing
+relaxation, started from one OSEM iteration. FBP is the ramp filter with a window, scatter
+subtracted from the projections and first order Chang attenuation correction; it is scaled to the
+same native units as OSEM. Output count scaling is optional:
     native      = PyTomography's OSEM units (expected counts per voxel per projection view)
     views       = native x number of views: counts each voxel contributes over the whole
                   acquisition (default; keeps the effect of attenuation/scatter correction)
@@ -112,8 +116,8 @@ class DICOMSpectRecon:
         parent.categories = ["Developer Tools.DICOM Plugins"]
         parent.contributors = ["Burak Demir"]
         parent.helpText = (
-            "Loads SPECT projection data from DICOM and reconstructs it with OSEM "
-            "(PyTomography), with an interactive preview before loading."
+            "Loads SPECT projection data from DICOM and reconstructs it with OSEM, "
+            "BSREM or FBP (PyTomography), with an interactive preview before loading."
         )
         parent.acknowledgementText = "Reconstruction powered by PyTomography."
         parent.hidden = True
@@ -131,7 +135,7 @@ class DICOMSpectRecon:
 class DICOMSpectReconPluginClass(DICOMPlugin):
     def __init__(self):
         super().__init__()
-        self.loadType = "SPECT Projections (OSEM Recon)"
+        self.loadType = "SPECT Projections (OSEM/BSREM/FBP Recon)"
         self.tags["modality"] = "0008,0060"
         self.tags["imageType"] = "0008,0008"
         self.tags["seriesDescription"] = "0008,103e"
@@ -244,7 +248,7 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
             loadable = DICOMLoadable()
             loadable.files = [f]
             loadable.name = f"{desc} OSEM" + (f" ({i + 1})" if len(spectFiles) > 1 else "")
-            tooltip = "SPECT projections - reconstructed with OSEM (PyTomography) on load"
+            tooltip = "SPECT projections - reconstructed with OSEM, BSREM or FBP (PyTomography) on load"
             if candidates:
                 tooltip += (f"\nCT available for attenuation correction: {len(candidates)} series, "
                             f"best match {candidates[0]['label']}")
@@ -283,7 +287,11 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
             suffix += " SC"
         units = info.get("Units", "counts")
         unitSuffix = {"Bq/ml": " Bqml", "SUVbw": " SUVbw", "SUL": " SUL"}.get(units, "")
-        nodeName = slicer.mrmlScene.GenerateUniqueName(f"{loadable.name} {suffix}{unitSuffix}")
+        baseName = loadable.name
+        algorithm = info.get("Algorithm", "OSEM")
+        if algorithm != "OSEM" and " OSEM" in baseName:
+            baseName = baseName.replace(" OSEM", f" {algorithm}", 1)
+        nodeName = slicer.mrmlScene.GenerateUniqueName(f"{baseName} {suffix}{unitSuffix}")
         volumeNode = sitkUtils.PushVolumeToSlicer(image, name=nodeName)
 
         # Keep reconstruction settings with the volume (traceability for dosimetry)

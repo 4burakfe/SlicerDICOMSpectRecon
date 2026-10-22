@@ -1,4 +1,4 @@
-"""OSEM reconstruction with PyTomography, output count scaling and post-filters.
+"""OSEM, BSREM and FBP reconstruction with PyTomography, output count scaling and post-filters.
 
 No Slicer dependency. torch, pytomography and SimpleITK are imported when used, so
 importing this module is cheap (it is imported when Slicer starts).
@@ -24,6 +24,22 @@ CONSISTENCY_TOLERANCE = 0.15   # |forward model / measured - 1| above this is fl
 SCATTER_FRACTION_WARNING = 0.6  # scatter estimate above this fraction of the photopeak is flagged
 CT_COVERAGE_WARNING = 0.9      # fraction of SPECT slices that should contain tissue in the mu-map
 MU_MAX_PLAUSIBLE = 0.6         # /cm; far above bone at SPECT energies
+
+ALGORITHM_OSEM = "OSEM"
+ALGORITHM_BSREM = "BSREM"
+ALGORITHM_FBP = "FBP"
+ALGORITHMS = [ALGORITHM_OSEM, ALGORITHM_BSREM, ALGORITHM_FBP]
+ITERATIVE_ALGORITHMS = (ALGORITHM_OSEM, ALGORITHM_BSREM)
+
+# BSREM: OSEM iterations used as the starting image (as in Q.Clear), and the relaxation sequence
+# alpha(n) = 1 / (1 + n / BSREM_RELAXATION_ITERATIONS), which makes the iterations converge
+BSREM_WARM_START_ITERATIONS = 1
+BSREM_RELAXATION_ITERATIONS = 10.0
+
+# FBP windows multiplied onto the ramp. Each is a function of f and the cutoff fc, both as a
+# fraction of the Nyquist frequency.
+FBP_WINDOWS = ["Ramp", "Shepp-Logan", "Cosine", "Hamming", "Hann", "Butterworth"]
+FBP_WINDOWS_WITH_ORDER = ("Butterworth",)
 
 
 class ReconstructionAborted(Exception):
@@ -88,8 +104,10 @@ class _OsemMonitor:
     """PyTomography callback: reports progress after every subset and aborts on request.
     Duck-typed (run/finalize) so it works across PyTomography 3.x callback signatures."""
 
-    def __init__(self, label, nIters, nSubsets, progress=None, shouldAbort=None):
+    def __init__(self, label, nIters, nSubsets, progress=None, shouldAbort=None, done=0, total=None):
         self.label = label
+        self.offset = done  # subset updates already reported (BSREM warm start)
+        self.overall = total
         self.total = max(1, nIters * nSubsets)
         self.nSubsets = max(1, nSubsets)
         self.nIters = nIters
@@ -99,7 +117,7 @@ class _OsemMonitor:
     def run(self, object, n_iter=0, n_subset=0, *args, **kwargs):
         if self.progress is not None:
             done = n_iter * self.nSubsets + n_subset + 1
-            self.progress(self.label, done, self.total,
+            self.progress(self.label, self.offset + done, self.overall or self.total,
                           f"{self.label}: iteration {n_iter + 1}/{self.nIters}, "
                           f"subset {n_subset + 1}/{self.nSubsets}")
         if self.shouldAbort is not None and self.shouldAbort():
@@ -108,6 +126,89 @@ class _OsemMonitor:
 
     def finalize(self, *args, **kwargs):
         return None
+
+
+def fbpWindow(name, f, cutoff, order=10):
+    """Window H(f) applied with the FBP ramp; f and cutoff as fractions of the Nyquist frequency.
+    All but Butterworth are zero above the cutoff; Ramp is the plain ramp cut off there."""
+    f = np.asarray(f, dtype=np.float64)
+    cutoff = max(float(cutoff), 1e-6)
+    x = np.minimum(f / cutoff, 1.0)
+    inside = f <= cutoff
+    if name == "Butterworth":
+        with np.errstate(over="ignore"):
+            return 1.0 / (1.0 + (f / cutoff) ** (2 * int(order)))
+    if name == "Ramp":
+        window = np.ones_like(f)
+    elif name == "Shepp-Logan":
+        window = np.sinc(x / 2.0)  # sin(pi f / 2fc) / (pi f / 2fc)
+    elif name == "Cosine":
+        window = np.cos(np.pi * x / 2.0)
+    elif name == "Hamming":
+        window = 0.54 + 0.46 * np.cos(np.pi * x)
+    elif name == "Hann":
+        window = 0.5 * (1.0 + np.cos(np.pi * x))
+    else:
+        raise ValueError(f"Unknown FBP window '{name}'.")
+    return np.where(inside, window, 0.0)
+
+
+def _rampResponse(n):
+    """DFT of the band-limited spatial ramp (Ram-Lak, Kak & Slaney eq. 3.61) on n samples, unit
+    pixel. Unlike sampling |f| directly it has the right DC value, so FBP keeps the total counts."""
+    k = np.arange(n)
+    k = np.minimum(k, n - k)  # circular distance
+    h = np.zeros(n)
+    h[0] = 0.25
+    odd = (k % 2) == 1
+    h[odd] = -1.0 / (np.pi * k[odd]) ** 2
+    return np.real(np.fft.fft(h))
+
+
+def filterProjectionsFBP(projections, window, cutoff, order, pixelR, pixelZ):
+    """Ramp-filter SPECT projections [views, r, z] along r and apply the window in 2D (r and z,
+    the way camera software applies a Butterworth/Hann pre-filter). cutoff is a fraction of the
+    radial Nyquist frequency; frequencies are physical so the window is isotropic when the pixels
+    are not square. Zero padding to at least twice the size avoids wrap-around."""
+    arr = np.asarray(projections, dtype=np.float64)
+    _, nr, nz = arr.shape
+    padR = int(2 ** np.ceil(np.log2(max(2 * nr, 2))))
+    padZ = int(2 ** np.ceil(np.log2(max(2 * nz, 2))))
+    nyquist = 1.0 / (2.0 * float(pixelR))
+    fr = np.fft.fftfreq(padR, d=float(pixelR)) / nyquist
+    fz = np.fft.fftfreq(padZ, d=float(pixelZ)) / nyquist
+    f = np.sqrt(fr[:, None] ** 2 + fz[None, :] ** 2)
+    response = _rampResponse(padR)[:, None] * fbpWindow(window, f, cutoff, order)
+    spectrum = np.fft.fft2(arr, s=(padR, padZ), axes=(1, 2)) * response[None, :, :]
+    return np.real(np.fft.ifft2(spectrum, axes=(1, 2)))[:, :nr, :nz]
+
+
+def filteredBackProjection(projections, systemMatrix, window, cutoff, order, pixelR, pixelZ):
+    """FBP: (pi / number of views) x backprojection of the filtered projections. The system matrix
+    must model only the geometry (no attenuation or PSF). Units are the same as OSEM's: an image
+    whose forward projection reproduces the projections (counts per voxel per view)."""
+    import torch
+    device = projections.device if hasattr(projections, "device") else None
+    data = projections.detach().cpu().numpy() if hasattr(projections, "detach") else np.asarray(projections)
+    filtered = filterProjectionsFBP(data, window, cutoff, order, pixelR, pixelZ)
+    filtered = torch.as_tensor(filtered, dtype=torch.float32)
+    if device is not None:
+        filtered = filtered.to(device)
+    nViews = int(filtered.shape[0])
+    return systemMatrix.backward(filtered) * (np.pi / nViews)
+
+
+def changCorrection(attenuatedMatrix, geometricMatrix, maximum=20.0):
+    """First order Chang attenuation correction factors for FBP: 1 / (mean attenuation factor over
+    the views) = A^T 1 / A_mu^T 1, with A_mu the system matrix with attenuation. Capped, so voxels
+    that no view sees unattenuated (outside the camera orbit) cannot blow up."""
+    import torch
+    with torch.no_grad():
+        plain = geometricMatrix.compute_normalization_factor()
+        attenuated = attenuatedMatrix.compute_normalization_factor()
+    factor = plain / torch.clamp(attenuated, min=1e-6)
+    factor = torch.where(plain > 0, factor, torch.ones_like(factor))
+    return torch.clamp(factor, 1.0, float(maximum))
 
 
 class SpectReconLogic:
@@ -242,10 +343,14 @@ class SpectReconLogic:
                      "(metal, contrast or a CT that is not in HU?).")
 
     def reconstruct(self, iters, subsets, useAttenuationCorrection=False,
-                    scatter=None, projectionSet=None):
-        """OSEM reconstruction in PyTomography's native units (counts per voxel per view).
+                    scatter=None, projectionSet=None, algorithm=ALGORITHM_OSEM, fbp=None, bsrem=None):
+        """OSEM or FBP reconstruction in PyTomography's native units (counts per voxel per view).
         scatter: None, or (indexLower, indexUpper[, weight]) with indexUpper possibly None (dual
         window) and weight None (automatic) or a manual dual window scatter weight.
+        bsrem (BSREM only): {"beta", "gamma"} of the relative difference prior; iters and subsets are
+        the BSREM ones.
+        fbp (FBP only): {"window", "cutoff" (cycles/cm), "order"}. FBP subtracts the scatter estimate
+        from the projections and corrects attenuation with the first order Chang method.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
         import torch
         import SimpleITK as sitk
@@ -258,10 +363,17 @@ class SpectReconLogic:
         base_temp_dir = None
         try:
             nViews = projectionSet.nViews
-            if subsets < 1 or subsets > nViews:
-                raise ValueError(f"{subsets} subsets requested, but there are only {nViews} projection views.")
-            if iters < 1:
-                raise ValueError("At least one OSEM iteration is needed.")
+            if algorithm not in ALGORITHMS:
+                raise ValueError(f"Unknown reconstruction algorithm '{algorithm}'.")
+            if algorithm in ITERATIVE_ALGORITHMS:
+                if subsets < 1 or subsets > nViews:
+                    raise ValueError(f"{subsets} subsets requested, but there are only {nViews} projection views.")
+                if iters < 1:
+                    raise ValueError(f"At least one {algorithm} iteration is needed.")
+                if algorithm == ALGORITHM_BSREM and (not bsrem or float(bsrem.get("beta", -1)) < 0):
+                    raise ValueError("BSREM needs a prior strength (beta) of 0 or more.")
+            elif not fbp or fbp.get("window") not in FBP_WINDOWS:
+                raise ValueError("FBP needs a filter window (" + ", ".join(FBP_WINDOWS) + ").")
 
             obj2obj_transforms = []
             if useAttenuationCorrection:
@@ -300,16 +412,23 @@ class SpectReconLogic:
                 proj_meta=projectionSet.proj_meta
             )
 
-            # 3. OSEM Reconstruction
-            self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
-            if subsets > 1 and nViews % subsets != 0:
-                self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
-            likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections,
-                                              additive_term=additive_term)
-            reconstruction_algorithm = OSEM(likelihood)
-            monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort)
-            reconstructed_object = reconstruction_algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
-            self.log("OSEM reconstruction complete.")
+            # 3. Reconstruction
+            if algorithm == ALGORITHM_FBP:
+                reconstructed_object = self._reconstructFBP(projectionSet, system_matrix, additive_term,
+                                                            useAttenuationCorrection, fbp)
+            elif algorithm == ALGORITHM_BSREM:
+                reconstructed_object = self._reconstructBSREM(projectionSet, system_matrix, additive_term,
+                                                              iters, subsets, bsrem)
+            else:
+                self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
+                if subsets > 1 and nViews % subsets != 0:
+                    self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
+                likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections,
+                                                  additive_term=additive_term)
+                reconstruction_algorithm = OSEM(likelihood)
+                monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort)
+                reconstructed_object = reconstruction_algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
+                self.log("OSEM reconstruction complete.")
 
             if not bool(torch.isfinite(reconstructed_object).all()):
                 raise ValueError("The reconstruction contains invalid values (NaN/inf).")
@@ -365,6 +484,80 @@ class SpectReconLogic:
         finally:
             if base_temp_dir and os.path.exists(base_temp_dir):
                 shutil.rmtree(base_temp_dir, ignore_errors=True)
+
+
+    def _reconstructBSREM(self, projectionSet, system_matrix, additive_term, iters, subsets, bsrem):
+        """BSREM with a relative difference prior, started from OSEM. The decreasing relaxation makes it
+        converge, so beta (not the iteration count) sets the noise; no post-filter is needed."""
+        from pytomography.likelihoods import PoissonLogLikelihood
+        from pytomography.algorithms import BSREM, OSEM
+        from pytomography.priors import RelativeDifferencePrior
+
+        beta, gamma = float(bsrem["beta"]), float(bsrem.get("gamma", 2.0))
+        nViews = projectionSet.nViews
+        self.log(f"Running BSREM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets}, "
+                 f"relative difference prior beta {beta:g}, gamma {gamma:g})...")
+        if subsets > 1 and nViews % subsets != 0:
+            self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
+        likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections, additive_term=additive_term)
+        warm = BSREM_WARM_START_ITERATIONS
+        total = (warm + iters) * subsets
+        self.log(f"  -> Starting image: {warm} OSEM iteration(s) x {subsets} subsets")
+        monitor = _OsemMonitor(f"{projectionSet.label} (OSEM start)", warm, subsets,
+                               self.progress, self.shouldAbort, total=total)
+        initial = OSEM(likelihood)(n_iters=warm, n_subsets=subsets, callback=monitor)
+        prior = RelativeDifferencePrior(beta=beta, gamma=gamma) if beta > 0 else None
+        algorithm = BSREM(likelihood, object_initial=initial.clone(), prior=prior,
+                          relaxation_sequence=lambda n: 1.0 / (1.0 + n / BSREM_RELAXATION_ITERATIONS))
+        monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort,
+                               done=warm * subsets, total=total)
+        image = algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
+        self.log("BSREM reconstruction complete.")
+        return image
+
+    def _reconstructFBP(self, projectionSet, system_matrix, additive_term, useAttenuationCorrection, fbp):
+        """Filtered backprojection of one projection set; negative voxels are set to 0 (the image is
+        stored as unsigned DICOM, and negative counts have no meaning for the display or the VOIs)."""
+        import torch
+        from pytomography.projectors.SPECT import SPECTSystemMatrix
+
+        window, cutoffCm, order = fbp["window"], float(fbp.get("cutoff", 1.0)), int(fbp.get("order", 10))
+        pixelR, pixelZ = (float(d) for d in projectionSet.proj_meta.dr[:2])  # cm
+        fraction, clipped = cutoffFraction(cutoffCm, 10.0 * pixelR)
+        text = f"{window} window, cutoff {cutoffCm:.2f} cycles/cm = {fraction:.2f} x Nyquist"
+        if clipped:
+            text += " (limited to the Nyquist frequency)"
+        if window in FBP_WINDOWS_WITH_ORDER:
+            text += f", order {order}"
+        self.log(f"Running FBP on {projectionSet.label} ({text})...")
+        if self.progress is not None:
+            self.progress(projectionSet.label, 0, 1, f"{projectionSet.label}: filtered backprojection")
+        if self.shouldAbort is not None and self.shouldAbort():
+            raise ReconstructionAborted()
+
+        projections = projectionSet.projections
+        if additive_term is not None:
+            # FBP has no noise model: subtract the scatter estimate from the data
+            projections = torch.clamp(projections - additive_term, min=0)
+        geometric = system_matrix
+        if useAttenuationCorrection:
+            geometric = SPECTSystemMatrix(obj2obj_transforms=[], proj2proj_transforms=[],
+                                          object_meta=projectionSet.object_meta,
+                                          proj_meta=projectionSet.proj_meta)
+        with torch.no_grad():
+            image = filteredBackProjection(projections, geometric, window, fraction, order, pixelR, pixelZ)
+            if useAttenuationCorrection:
+                self.log("  -> Chang (first order) attenuation correction from the CT attenuation map")
+                image = image * changCorrection(system_matrix, geometric)
+        negative = float(-image[image < 0].sum().item())
+        positive = float(image[image > 0].sum().item())
+        image = torch.clamp(image, min=0)
+        if positive > 0:
+            self.log(f"  -> Negative FBP values set to 0 ({100.0 * negative / positive:.1f}% of the positive counts)")
+        if self.progress is not None:
+            self.progress(projectionSet.label, 1, 1, f"{projectionSet.label}: filtered backprojection done")
+        self.log("FBP reconstruction complete.")
+        return image
 
 
 def countScalingFactor(stats, mode):
@@ -481,6 +674,17 @@ def autoScatterWeight(peakWidth, lowerWidth):
     if not peakWidth or not lowerWidth or lowerWidth <= 0:
         return None
     return 0.5 * float(peakWidth) / float(lowerWidth)
+
+
+def bsremDescription(bsrem):
+    return f"relative difference prior beta={float(bsrem['beta']):g}, gamma={float(bsrem['gamma']):g}"
+
+
+def fbpDescription(fbp):
+    text = f"{fbp['window']} cutoff={float(fbp['cutoff']):.2f} cycles/cm"
+    if fbp["window"] in FBP_WINDOWS_WITH_ORDER:
+        text += f", order={int(fbp['order'])}"
+    return text
 
 
 def filterDescription(params):

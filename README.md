@@ -22,6 +22,15 @@ Author: Burak Demir, MD, FEBNM
 
 - **OSEM** reconstruction with [PyTomography](https://github.com/qurit/PyTomography), with separate
   iterations/subsets for the static and the gated images.
+- **BSREM** (block sequential regularised EM) with a relative difference prior, the approach of GE
+  Q.Clear: OSEM-like subset updates with a decreasing step, started from one OSEM iteration, so it
+  converges. The prior strength beta sets the noise level (default 0.3, gamma 2) instead of the
+  iteration count, and no post-filter is needed.
+- **FBP** (filtered backprojection) as an alternative: ramp filter with a Ramp, Shepp-Logan, Cosine,
+  Hamming, Hann or Butterworth window and a cutoff in cycles/cm (applied in 2D on the projections, like
+  camera software). Scatter is subtracted from the projections and attenuation is corrected with the
+  first order Chang method from the CT. The image is in the same units as OSEM; negative values are set
+  to 0.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
 - **Scatter correction** with dual or triple energy windows, chosen from the acquisition's windows.
@@ -46,7 +55,7 @@ Author: Burak Demir, MD, FEBNM
 
 1. Import the study into the DICOM database and select the NM SPECT series.
 2. Load opens the reconstruction window: projections in cine, reconstruction and CT fusion previews,
-   and the settings (OSEM, attenuation, scatter, filter, scaling, quantification).
+   and the settings (OSEM, BSREM or FBP, attenuation, scatter, filter, scaling, quantification).
 3. Press **Reconstruct**, check the preview, then **Load into Slicer**.
 
 ### SPECT Calibration module
@@ -72,7 +81,7 @@ DICOMSpectRecon/
   SPECTCalibration.py          calibration module (Nuclear Medicine category)
   DICOMSpectReconLib/
     nmdata.py                  NM header, energy windows, gating (incl. ECG R-R / beats), CT matching
-    reconstruction.py          PyTomography OSEM, count scaling, post-filters
+    reconstruction.py          PyTomography OSEM, BSREM and FBP, count scaling, post-filters
     quantification.py          calibration factors, Bq/ml, SUV, calibration library
     display.py                 in-memory previews
     dialog.py                  reconstruction window
