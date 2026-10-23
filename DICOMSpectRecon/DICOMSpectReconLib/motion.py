@@ -43,8 +43,8 @@ def frameSlots(nFrames, energyWindows=None, timeSlots=None):
 
 
 def slotGeometry(ds, nSlots):
-    """(angles in degrees, detector of each slot) as PyTomography computes them; evenly spread
-    angles over 360 degrees and one detector when the header does not say."""
+    """(angles in degrees, detector of each slot, clockwise) as PyTomography computes the angles;
+    evenly spread angles over 360 degrees and one detector when the header does not say."""
     try:
         detectors = np.asarray(ds.DetectorVector, dtype=int)
         uniqueDetectors = list(np.unique(detectors))
@@ -62,10 +62,32 @@ def slotGeometry(ds, nSlots):
             angles.extend(start + sign * step * np.arange(nAngles))
             slotDetectors.extend([detector] * nAngles)
         if len(angles) == nSlots:
-            return (np.asarray(angles) + 180.0) % 360.0, np.asarray(slotDetectors, dtype=int)
+            return ((np.asarray(angles) + 180.0) % 360.0, np.asarray(slotDetectors, dtype=int),
+                    direction not in ("CC", "CCW"))
     except Exception:
         pass
-    return np.arange(nSlots) * 360.0 / max(1, nSlots), np.ones(nSlots, dtype=int)
+    return np.arange(nSlots) * 360.0 / max(1, nSlots), np.ones(nSlots, dtype=int), False
+
+
+def displayOrder(angles, clockwise=True):
+    """Slots in the order the camera sweeps the angles (for sinograms and linograms): along the
+    rotation direction, starting after the largest angular gap (a 180 degree orbit) or, for a full
+    circle, at the first acquired view (slot 0), so the first view is at the top and the curves run
+    on without a jump."""
+    angles = np.asarray(angles, dtype=float) % 360.0
+    n = len(angles)
+    if n < 2:
+        return np.arange(n)
+    key = (-angles if clockwise else angles) % 360.0  # grows along the rotation
+    order = np.argsort(key, kind="stable")
+    sortedKeys = key[order]
+    gaps = np.diff(np.r_[sortedKeys, sortedKeys[0] + 360.0])
+    largest = int(np.argmax(gaps))
+    if gaps[largest] > 1.5 * np.median(gaps):
+        start = (largest + 1) % n
+    else:
+        start = int(np.where(order == 0)[0][0])
+    return np.roll(order, -start)
 
 
 def slotStack(frames, slots, energyWindows=None, peakWindow=None):
