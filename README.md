@@ -49,8 +49,9 @@ Author: Burak Demir, MD, FEBNM
   (up/down) movement by matching every view's axial count profile to the median profile, and sideways
   movement from the transaxial centre of mass, which follows a sinusoid over the angles until the
   patient moves (the acquisition is split in time where it jumps to another sinusoid, and the views are
-  moved back onto the longest one). Shifts can also be added by hand for a range of time steps (all
-  detectors or one); changing a step stops the cine and shows that view. The mouse wheel steps through
+  moved back onto the longest one). Shifts can also be added by hand to a single time step (the
+  default) or a range of steps, on all detectors or one, and are applied live; changing a step stops
+  the cine and shows that view. The mouse wheel steps through
   the projections, or moves the line over the other views. The shifts are applied to every energy window and gate before reconstruction.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.

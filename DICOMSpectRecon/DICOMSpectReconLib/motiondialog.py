@@ -2,6 +2,8 @@
 axial slice at the reference line, the projections (cine), the summed sinogram and the linogram are shown
 on the top row, the motion corrected ones below, with a plot of the shifts."""
 
+import threading
+
 import numpy as np
 import qt
 
@@ -11,7 +13,8 @@ from . import motion
 VIEW_SIZE = 240
 PLOT_HEIGHT = 170
 PLOT_WIDTH = 4 * VIEW_SIZE + 30
-RECON_DELAY_MS = 1000         # the slice is reconstructed 1 s after the last change
+RECON_DELAY_MS = 1000         # the slice is reconstructed after 1 s without changes
+RECON_POLL_MS = 50            # how often the window looks for a finished background slice
 CINE_INTERVAL_MS = 120
 DX_COLOUR = (255, 150, 40)    # lateral
 DZ_COLOUR = (60, 200, 255)    # axial
@@ -81,6 +84,7 @@ class MotionCorrectionWindow:
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
         self.plotRenderer = display.PixmapRenderer(PLOT_WIDTH)
         self._build(parent)
+        self._newManualBase()
         self._refresh()
 
     # ---------------- UI ----------------
@@ -165,6 +169,11 @@ class MotionCorrectionWindow:
         self.reconTimer.setSingleShot(True)
         self.reconTimer.setInterval(RECON_DELAY_MS)
         self.reconTimer.connect("timeout()", self._reconstructSlice)
+        self.reconPoll = qt.QTimer()
+        self.reconPoll.setInterval(RECON_POLL_MS)
+        self.reconPoll.connect("timeout()", self._collectSlice)
+        self.reconJob = None          # (thread, request number, result holder) of the running slice
+        self.reconRequest = 0
 
         self.cineTimer = qt.QTimer()
         self.cineTimer.setInterval(CINE_INTERVAL_MS)
@@ -216,19 +225,29 @@ class MotionCorrectionWindow:
         self.toSpin.setValue(nTimes)
         for spin in (self.fromSpin, self.toSpin):
             spin.setToolTip(f"Time step 1-{nTimes}: the n-th view of every detector is acquired at the same time")
-        self.manualDxSpin = self._doubleSpin(-30.0, 30.0, 0.5, 0.0, " px", "Lateral shift added (+ = right)")
-        self.manualDzSpin = self._doubleSpin(-30.0, 30.0, 0.5, 0.0, " px", "Axial shift added (+ = down)")
-        addButton = qt.QPushButton("Add to these views")
-        addButton.connect("clicked()", self.onManual)
-        self.fromSpin.connect("valueChanged(int)", lambda value: self._showStep(value - 1))
-        self.toSpin.connect("valueChanged(int)", lambda value: self._showStep(value - 1))
-        self.detectorCombo.connect("currentIndexChanged(int)", lambda index: self._showStep(self.fromSpin.value - 1))
+        self.modeCombo = qt.QComboBox()
+        self.modeCombo.addItems(["Single view", "Range"])
+        self.modeCombo.setToolTip("Shift one time step, or every step from - to")
+        self.manualDxSpin = self._doubleSpin(-30.0, 30.0, 0.1, 0.0, " px",
+                                             "Lateral shift added to the chosen views (+ = right), applied live")
+        self.manualDzSpin = self._doubleSpin(-30.0, 30.0, 0.1, 0.0, " px",
+                                             "Axial shift added to the chosen views (+ = down), applied live")
+        self.manualLabel = qt.QLabel("")
+        self.manualLabel.setWordWrap(True)
+        self.manualLabel.setStyleSheet("color: gray;")
+        self.modeCombo.connect("currentIndexChanged(int)", lambda index: self._onManualSelection())
+        self.fromSpin.connect("valueChanged(int)", lambda value: self._onManualSelection(value - 1))
+        self.toSpin.connect("valueChanged(int)", lambda value: self._onManualSelection(value - 1))
+        self.detectorCombo.connect("currentIndexChanged(int)", lambda index: self._onManualSelection())
+        self.manualDxSpin.connect("valueChanged(double)", lambda value: self._applyManual())
+        self.manualDzSpin.connect("valueChanged(double)", lambda value: self._applyManual())
+        manualForm.addRow("Mode:", self.modeCombo)
         manualForm.addRow("Detector:", self.detectorCombo)
-        manualForm.addRow("From step:", self.fromSpin)
+        manualForm.addRow("Step / from:", self.fromSpin)
         manualForm.addRow("To step:", self.toSpin)
         manualForm.addRow("dx:", self.manualDxSpin)
         manualForm.addRow("dz:", self.manualDzSpin)
-        manualForm.addRow(addButton)
+        manualForm.addRow(self.manualLabel)
         side.addWidget(manualGroup)
 
         resetButton = qt.QPushButton("Reset (no correction)")
@@ -306,21 +325,60 @@ class MotionCorrectionWindow:
                                      lateral=self.lateralCheck.checked)
         self.dx, self.dz = dx, dz
         self.log(f"Motion detection: {motion.describe(dx, dz)}")
+        self._newManualBase()
         self._refresh()
 
-    def onManual(self):
-        first, last = sorted((self.fromSpin.value - 1, self.toSpin.value - 1))
+    # Manual: dx / dz are added live to the chosen views on top of the correction they had when they
+    # were chosen; choosing other views keeps what was added and starts again from 0.
+    def _manualMask(self):
+        single = self.modeCombo.currentIndex == 0
+        self.toSpin.setEnabled(not single)
+        first = self.fromSpin.value - 1
+        last = first if single else self.toSpin.value - 1
+        first, last = sorted((first, last))
         mask = (self.times >= first) & (self.times <= last)
         if self.detectorCombo.currentIndex > 0:
             detector = int(np.unique(self.slotDetectors)[self.detectorCombo.currentIndex - 1])
             mask &= self.slotDetectors == detector
-        self.dx[mask] += self.manualDxSpin.value
-        self.dz[mask] += self.manualDzSpin.value
+        return mask
+
+    def _newManualBase(self):
+        self.manualBase = (self.dx.copy(), self.dz.copy())
+        self.manualMask = self._manualMask()
+        for spin in (self.manualDxSpin, self.manualDzSpin):
+            spin.blockSignals(True)
+            spin.setValue(0.0)
+            spin.blockSignals(False)
+        self._updateManualLabel()
+
+    def _updateManualLabel(self):
+        selected = np.where(self.manualMask)[0]
+        if not selected.size:
+            self.manualLabel.setText("No views chosen")
+            return
+        dx, dz = self.dx[selected], self.dz[selected]
+        if selected.size == 1:
+            self.manualLabel.setText(f"View {int(selected[0]) + 1}: dx {dx[0]:+.2f} px, dz {dz[0]:+.2f} px")
+        else:
+            self.manualLabel.setText(f"{selected.size} views: dx {dx.min():+.2f} to {dx.max():+.2f} px, "
+                                     f"dz {dz.min():+.2f} to {dz.max():+.2f} px")
+
+    def _onManualSelection(self, step=None):
+        self._newManualBase()
+        self._showStep(self.fromSpin.value - 1 if step is None else step)
+
+    def _applyManual(self):
+        dx, dz = self.manualBase[0].copy(), self.manualBase[1].copy()
+        dx[self.manualMask] += self.manualDxSpin.value
+        dz[self.manualMask] += self.manualDzSpin.value
+        self.dx, self.dz = dx, dz
+        self._updateManualLabel()
         self._refresh()
 
     def onReset(self):
         self.dx[:] = 0.0
         self.dz[:] = 0.0
+        self._newManualBase()
         self._refresh()
 
     # ---------------- display ----------------
@@ -357,23 +415,51 @@ class MotionCorrectionWindow:
 
     # ---------------- fast axial slice ----------------
     def _scheduleRecon(self):
-        """(Re)start the 1 s wait: dragging the line or changing the shifts restarts it."""
+        """(Re)start the 1 s wait: every change (line, shifts) restarts it, so nothing is computed
+        while the user is still dragging or typing."""
+        self.reconRequest += 1  # a slice still running for older settings is not shown
         self.reconTimer.start()
 
     def _reconstructSlice(self):
-        row = self.rowSlider.value
-        try:
-            params = self.reconParams
-            if self.sliceRecon is None:
-                subsets = params.get("subsets", 1) if params.get("algorithm") != "FBP" else 1
-                self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2], subsets)
-            if self.originalSlice is None or self.originalSlice[0] != row:
-                self.originalSlice = (row, motion.reconstructSliceAt(self.sliceRecon, self.stack, row, params,
-                                                                     self.pixelMm))
-            corrected = motion.reconstructSliceAt(self.sliceRecon, self.corrected, row, params, self.pixelMm)
-        except Exception as e:
-            self.log(f"Fast slice reconstruction failed: {e}")
+        """Start the slice in a background thread, so the window stays responsive."""
+        if self.reconJob is not None:
+            self.reconTimer.start()  # one at a time: try again when the running one is done
             return
+        row, request = self.rowSlider.value, self.reconRequest
+        params, corrected = self.reconParams, self.corrected
+        original = self.originalSlice if self.originalSlice is not None and self.originalSlice[0] == row else None
+        holder = {}
+
+        def work():
+            try:
+                if self.sliceRecon is None:
+                    subsets = params.get("subsets", 1) if params.get("algorithm") != "FBP" else 1
+                    self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2], subsets)
+                first = original
+                if first is None:
+                    first = (row, motion.reconstructSliceAt(self.sliceRecon, self.stack, row, params, self.pixelMm))
+                holder["result"] = (row, first, motion.reconstructSliceAt(self.sliceRecon, corrected, row,
+                                                                          params, self.pixelMm))
+            except Exception as e:
+                holder["error"] = e
+
+        thread = threading.Thread(target=work, daemon=True)
+        self.reconJob = (thread, request, holder)
+        thread.start()
+        self.reconPoll.start()
+
+    def _collectSlice(self):
+        if self.reconJob is None or self.reconJob[0].is_alive():
+            return
+        _, request, holder = self.reconJob
+        self.reconJob = None
+        self.reconPoll.stop()
+        if "error" in holder:
+            self.log(f"Fast slice reconstruction failed: {holder['error']}")
+            return
+        row, self.originalSlice, corrected = holder["result"]
+        if request != self.reconRequest:
+            return  # settings changed meanwhile; the newer request is already waiting
         original = self.originalSlice[1]
         vmax = float(original.max()) or float(corrected.max()) or 1.0
         for kind, image in (("original", original), ("corrected", corrected)):
@@ -427,5 +513,8 @@ class MotionCorrectionWindow:
         finally:
             self.cineTimer.stop()
             self.reconTimer.stop()
+            self.reconPoll.stop()
+            if self.reconJob is not None:
+                self.reconJob[0].join()
             self.renderer.cleanup()
             self.plotRenderer.cleanup()
