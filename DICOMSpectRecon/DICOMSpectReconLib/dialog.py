@@ -23,6 +23,8 @@ from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
 RR_AUTO = "Auto"
+RR_OSEM_FACTOR = 4    # OSEM iterations x this with resolution recovery (slower convergence with the PSF)
+RR_BSREM_FACTOR = 2
 DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
 
@@ -494,6 +496,21 @@ class SpectReconDialog:
                                 "header. Edit or add collimators in the SPECT Collimators module.")
         self.rrNote = qt.QLabel("")
         self.rrNote.setWordWrap(True)
+        self.rrOsemFactorSpin = qt.QSpinBox()
+        self.rrOsemFactorSpin.setRange(1, 20)
+        self.rrOsemFactorSpin.setValue(RR_OSEM_FACTOR)
+        self.rrOsemFactorSpin.setPrefix("x ")
+        self.rrOsemFactorSpin.setToolTip(
+            "With resolution recovery OSEM recovers resolution much more slowly per iteration, so the OSEM "
+            "iterations (static and gated) are multiplied by this while resolution recovery is on. "
+            "The iteration box itself is not changed.")
+        self.rrBsremFactorSpin = qt.QSpinBox()
+        self.rrBsremFactorSpin.setRange(1, 20)
+        self.rrBsremFactorSpin.setValue(RR_BSREM_FACTOR)
+        self.rrBsremFactorSpin.setPrefix("x ")
+        self.rrBsremFactorSpin.setToolTip(
+            "BSREM iterations are multiplied by this while resolution recovery is on (BSREM converges, but "
+            "more slowly with the PSF in the model). The iteration box itself is not changed.")
         self._loadCollimators()
         self.reconRows = {}
         for row, (key, label, widget) in enumerate([
@@ -503,13 +520,18 @@ class SpectReconDialog:
                 ("bsrem", "Beta:", self.bsremBetaSpin), ("bsrem", "Gamma:", self.bsremGammaSpin),
                 ("fbp", "Window:", self.fbpWindowCombo), ("fbp", "Cutoff:", self.fbpCutoffSpin),
                 ("fbp", "", self.fbpCutoffNyquistLabel), ("fbpOrder", "Order:", self.fbpOrderSpin),
-                ("rr", "", self.rrCheckBox), ("rr", "Collimator:", self.rrCombo), ("rr", "", self.rrNote)]):
+                ("rr", "", self.rrCheckBox), ("rr", "Collimator:", self.rrCombo), ("rr", "", self.rrNote),
+                ("rrOsem", "RR iterations:", self.rrOsemFactorSpin),
+                ("rrBsrem", "RR iterations:", self.rrBsremFactorSpin)]):
             labelWidget = qt.QLabel(label)
             reconForm.addWidget(labelWidget, row, 0)
             reconForm.addWidget(widget, row, 1)
             self.reconRows.setdefault(key, []).extend([labelWidget, widget])
-        reconForm.setRowStretch(13, 1)
+        reconForm.setRowStretch(15, 1)
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateRrNote())
+        self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateAlgorithmRows())
+        for spin in (self.rrOsemFactorSpin, self.rrBsremFactorSpin):
+            spin.connect("valueChanged(int)", lambda value: self._updateRrNote())
         self.rrCombo.connect("currentIndexChanged(int)", lambda index: self._updateRrNote())
         self.fbpCutoffSpin.connect("valueChanged(double)", lambda v: self._showNyquistFraction(
             self.fbpCutoffSpin, self.fbpCutoffNyquistLabel))
@@ -771,7 +793,8 @@ class SpectReconDialog:
                    ("fbpCutoff", self.fbpCutoffSpin), ("fbpOrder", self.fbpOrderSpin),
                    ("filter", self.filterCombo), ("fwhm", self.fwhmSpin), ("cutoff", self.cutoffSpin),
                    ("order", self.orderSpin), ("resolutionRecovery", self.rrCheckBox),
-                   ("collimator", self.rrCombo), ("scaling", self.scalingCombo),
+                   ("collimator", self.rrCombo), ("rrOsemFactor", self.rrOsemFactorSpin),
+                   ("rrBsremFactor", self.rrBsremFactorSpin), ("scaling", self.scalingCombo),
                    ("attenuationCorrection", self.acCheckBox), ("showOnCt", self.showOnCtCheckBox),
                    ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin)]
         if self.isGated:
@@ -1077,10 +1100,14 @@ class SpectReconDialog:
         calibratedAlgorithm = recon.get("algorithm") or ALGORITHM_OSEM
         if calibratedAlgorithm != self.algorithmCombo.currentText:
             warnings.append(f"calibrated with {calibratedAlgorithm}, current {self.algorithmCombo.currentText}")
-        elif calibratedAlgorithm == ALGORITHM_OSEM and recon.get("iterations") and (recon.get("iterations"), recon.get("subsets")) != \
-                (self.itersSpin.value, self.subsetsSpin.value):
-            warnings.append(f"calibrated with {recon.get('iterations')} iterations x {recon.get('subsets')} "
-                            f"subsets, current {self.itersSpin.value} x {self.subsetsSpin.value}")
+        else:
+            iters = self.itersSpin.value
+            if self.rrCheckBox.checked and calibratedAlgorithm == ALGORITHM_OSEM:
+                iters *= self.rrOsemFactorSpin.value
+            if calibratedAlgorithm == ALGORITHM_OSEM and recon.get("iterations") and \
+                    (recon.get("iterations"), recon.get("subsets")) != (iters, self.subsetsSpin.value):
+                warnings.append(f"calibrated with {recon.get('iterations')} iterations x {recon.get('subsets')} "
+                                f"subsets, current {iters} x {self.subsetsSpin.value}")
         calibratedRr = recon.get("resolutionRecovery") or ""
         currentRr = ""
         if self.rrCheckBox.checked and self.algorithmCombo.currentText in ITERATIVE_ALGORITHMS:
@@ -1552,7 +1579,9 @@ class SpectReconDialog:
         for key, visible in (("osem", algorithm == ALGORITHM_OSEM), ("bsrem", algorithm == ALGORITHM_BSREM),
                              ("subsets", algorithm in ITERATIVE_ALGORITHMS), ("fbp", fbp),
                              ("fbpOrder", fbp and self.fbpWindowCombo.currentText in FBP_WINDOWS_WITH_ORDER),
-                             ("rr", algorithm in ITERATIVE_ALGORITHMS)):
+                             ("rr", algorithm in ITERATIVE_ALGORITHMS),
+                             ("rrOsem", algorithm == ALGORITHM_OSEM and self.rrCheckBox.checked),
+                             ("rrBsrem", algorithm == ALGORITHM_BSREM and self.rrCheckBox.checked)):
             for widget in self.reconRows[key]:
                 widget.setVisible(visible)
         if self.isGated:
@@ -1671,6 +1700,8 @@ class SpectReconDialog:
             "gated": False,
         }
         params["psf"] = self.rrParams(params["indexPeak"])
+        params["rrFactor"] = {ALGORITHM_OSEM: self.rrOsemFactorSpin.value,
+                              ALGORITHM_BSREM: self.rrBsremFactorSpin.value}
         if self._scatterAvailable() and self.scatterCheckBox.checked:
             lower = self.lowerCombo.currentIndex - 1
             upper = self.upperCombo.currentIndex - 1
@@ -1714,15 +1745,26 @@ class SpectReconDialog:
             return None
         return (params["indexLower"], params["indexUpper"], params.get("scatterWeight"))
 
-    @staticmethod
-    def reconIterations(params, gated=False):
+    @classmethod
+    def reconIterations(cls, params, gated=False):
         """(iterations, subsets) of the static or gated reconstruction; (None, None) for FBP.
-        BSREM gates use the static BSREM settings."""
+        BSREM gates use the static BSREM settings. With resolution recovery the iterations are
+        multiplied by the RR iteration factor of the algorithm."""
         if params["algorithm"] == ALGORITHM_OSEM:
-            return (params["gatedIters"], params["gatedSubsets"]) if gated else (params["iters"], params["subsets"])
-        if params["algorithm"] == ALGORITHM_BSREM:
-            return params["bsrem"]["iters"], params["subsets"]
-        return None, None
+            iters, subsets = (params["gatedIters"], params["gatedSubsets"]) if gated else \
+                (params["iters"], params["subsets"])
+        elif params["algorithm"] == ALGORITHM_BSREM:
+            iters, subsets = params["bsrem"]["iters"], params["subsets"]
+        else:
+            return None, None
+        return iters * cls.rrIterationFactor(params), subsets
+
+    @classmethod
+    def rrIterationFactor(cls, params):
+        """Iteration multiplier in use: the algorithm's RR factor while resolution recovery is on, else 1."""
+        if cls.psfArgument(params) is None:
+            return 1
+        return int(params.get("rrFactor", {}).get(params["algorithm"], 1) or 1)
 
     @staticmethod
     def bsremParams(params, gated=False):
@@ -1951,6 +1993,10 @@ class SpectReconDialog:
             key = self.reconKeyFor(params)
             if self.reconImage is None or key != self.reconKey:
                 iters, subsets = self.reconIterations(params)
+                factor = self.rrIterationFactor(params)
+                if factor > 1:
+                    self.log(f"Resolution recovery: {iters // factor} x {factor} = {iters} {params['algorithm']} "
+                             "iterations (static and gated).")
                 self.reconImage, self.reconStats = self.logic.reconstruct(
                     iters, subsets, params["attenuationCorrection"], scatter,
                     algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"],
@@ -2139,7 +2185,8 @@ class SpectReconDialog:
         watched = [self.algorithmCombo, self.itersSpin, self.subsetsSpin, self.bsremItersSpin,
                    self.bsremBetaSpin, self.bsremGammaSpin, self.fbpWindowCombo,
                    self.fbpCutoffSpin, self.fbpOrderSpin, self.filterCombo, self.fwhmSpin, self.cutoffSpin,
-                   self.orderSpin, self.rrCheckBox, self.rrCombo, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
+                   self.orderSpin, self.rrCheckBox, self.rrCombo, self.rrOsemFactorSpin, self.rrBsremFactorSpin,
+                   self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
                    self.peakCombo, self.lowerCombo, self.upperCombo, self.scatterWeightSpin,
                    self.quantGroup, self.calibrationCombo,
                    self.durationSpin, self.midTimeEdit, self.midTimeFromDicom, self.suvGroup, self.suvTypeCombo,
