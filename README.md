@@ -40,6 +40,13 @@ Author: Burak Demir, MD, FEBNM
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
   While it is on, the iterations are multiplied by an "RR iterations" factor (x2 for OSEM, static and
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
+- **Motion correction** (orange *Motion correction...* button): a separate window shows the sinogram and
+  linogram before and after the correction and a plot of the shift of every view. *Detect* finds axial
+  (up/down) movement by matching every view's axial count profile to the median profile, and sideways
+  movement from the transaxial centre of mass, which follows a sinusoid over the angles until the
+  patient moves (the acquisition is split in time where it jumps to another sinusoid, and the views are
+  moved back onto the longest one). Shifts can also be added by hand for a range of time steps (all
+  detectors or one). The shifts are applied to every energy window and gate before reconstruction.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
 - **Scatter correction** with dual or triple energy windows, chosen from the acquisition's windows.
@@ -109,6 +116,8 @@ DICOMSpectRecon/
     reconstruction.py          PyTomography OSEM, BSREM and FBP, count scaling, post-filters
     quantification.py          calibration factors, Bq/ml, SUV, calibration library
     collimators.py             collimator library, header matching, resolution recovery PSF
+    motion.py                  motion detection and projection shifts
+    motiondialog.py            motion correction window
     display.py                 in-memory previews
     dialog.py                  reconstruction window
   Resources/Icons/

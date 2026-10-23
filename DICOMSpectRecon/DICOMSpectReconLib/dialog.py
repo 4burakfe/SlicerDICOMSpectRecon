@@ -19,6 +19,7 @@ from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, ALGORITHM_OSEM, ALG
                              pytomographyVersion, scaleCounts, scatterDescription)
 from . import collimators
 from . import display
+from . import motion
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
@@ -163,25 +164,6 @@ def sameScatterWeight(a, b):
     return abs(float(a) - float(b)) < 1e-6
 
 
-def sinogramStack(frames, detectors=None, views=None):
-    """Projection frames [n, rows, cols] of one energy window as [angles, rows, cols]: frames of the
-    same detector and angular view (the gates of a gated study) are summed, ordered by detector and
-    view (detector 1 covers the first part of the orbit, detector 2 the next)."""
-    frames = np.asarray(frames, dtype=np.float32)
-    n = frames.shape[0]
-    if detectors is None or views is None or len(detectors) != n or len(views) != n:
-        return frames
-    keys = sorted({(int(d), int(v)) for d, v in zip(detectors, views)})
-    if len(keys) == n:
-        order = sorted(range(n), key=lambda i: (int(detectors[i]), int(views[i])))
-        return frames[order]
-    index = {key: i for i, key in enumerate(keys)}
-    stack = np.zeros((len(keys),) + frames.shape[1:], dtype=np.float32)
-    for i in range(n):
-        stack[index[(int(detectors[i]), int(views[i]))]] += frames[i]
-    return stack
-
-
 class WheelScrollFilter(qt.QObject):
     """Forwards mouse wheel events over a preview panel to a slider."""
 
@@ -284,6 +266,7 @@ class SpectReconDialog:
         self.windowFilters = []
         self.windows = dict(DEFAULT_WINDOWS)
         self.sinoStack = None        # photopeak projections by angle (gates summed): [angles, rows, cols]
+        self.motion = None           # (dx, dz) pixel shifts per projection slot, or None
         self.projModeIndex = {}      # slider position of each projection display mode
         self.logic = None
         self.reconImage = None       # unfiltered static recon in native units (cached)
@@ -514,6 +497,19 @@ class SpectReconDialog:
         side.setSpacing(4)
         sideScroll.setWidget(sideWidget)
         rightLayout.addWidget(sideScroll, 1)
+
+        motionRow = qt.QHBoxLayout()
+        self.motionButton = qt.QPushButton("Motion correction...")
+        self.motionButton.setStyleSheet("QPushButton { background-color: #e07b00; color: white; font-weight: bold; "
+                                        "padding: 4px 10px; } QPushButton:disabled { background-color: #8a6a40; }")
+        self.motionButton.setToolTip("Find and correct patient motion on the projections (automatic or manual), "
+                                     "with the sinogram and linogram before and after")
+        self.motionButton.connect("clicked()", self.onMotionCorrection)
+        self.motionLabel = qt.QLabel("No motion correction")
+        self.motionLabel.setWordWrap(True)
+        motionRow.addWidget(self.motionButton)
+        motionRow.addWidget(self.motionLabel, 1)
+        side.addLayout(motionRow)
 
         # Created first (currentParams reads it); placed at the bottom of the panel
         self.scalingCombo = _compactCombo()
@@ -1804,6 +1800,41 @@ class SpectReconDialog:
         return {"code": entry["code"] if entry else None, "entry": entry,
                 "energyKeV": self._photopeakKeV(indexPeak)}
 
+    # ---------------- motion correction ----------------
+    def motionKey(self):
+        if self.motion is None:
+            return None
+        return (tuple(np.round(self.motion[0], 3)), tuple(np.round(self.motion[1], 3)))
+
+    def onMotionCorrection(self):
+        raw = self.rawProjection
+        if raw is None:
+            self.log("The projections are not loaded yet.")
+            return
+        from .motiondialog import MotionCorrectionWindow
+        self.stopProjCine()
+        try:
+            window = MotionCorrectionWindow(
+                self.dialog, raw["frames"], raw["slots"], raw["ewv"], max(0, self.peakCombo.currentIndex) + 1,
+                raw["angles"], raw["slotDetectors"], pixelMm=self.pixelMm, initial=self.motion, log=self.log)
+            result = window.exec()
+        except Exception as e:
+            logging.error(traceback.format_exc())
+            self.log(f"ERROR: motion correction window failed: {e}")
+            return
+        finally:
+            if self.cineCheckBox.checked and not self.busy:
+                self.startProjCine()
+        if result is None:
+            return
+        dx, dz = result
+        self.motion = None if not (np.any(dx) or np.any(dz)) else (dx, dz)
+        text = motion.describe(*self.motion) if self.motion else "None"
+        self.log(f"Motion correction: {text}" + (" - press Reconstruct to apply it." if self.motion else "."))
+        self.motionLabel.setText("No motion correction" if self.motion is None else text)
+        self._showRawProjections()
+        self._updateLoadState()
+
     def _showNyquistFraction(self, slider, label):
         """What a cutoff in cycles/cm is on this study's pixels."""
         if not self.pixelMm:
@@ -1843,6 +1874,7 @@ class SpectReconDialog:
             "gated": False,
         }
         params["psf"] = self.rrParams(params["indexPeak"])
+        params["motion"] = self.motionKey()
         params["rrFactor"] = {ALGORITHM_OSEM: self.rrOsemFactorSpin.value,
                               ALGORITHM_BSREM: self.rrBsremFactorSpin.value}
         if self._scatterAvailable() and self.scatterCheckBox.checked:
@@ -1938,7 +1970,8 @@ class SpectReconDialog:
         if psf is not None:
             entry = psf["entry"]
             settings += (tuple(entry[k] for k in collimators.NUMERIC_FIELDS), psf["energyKeV"])
-        return (params["algorithm"], settings, params["attenuationCorrection"], ctId, params["indexPeak"],
+        return (params["algorithm"], settings, params.get("motion"), params["attenuationCorrection"], ctId,
+                params["indexPeak"],
                 params["indexLower"], params["indexUpper"], params.get("scatterWeight"), prefix)
 
     @staticmethod
@@ -1966,7 +1999,7 @@ class SpectReconDialog:
         self.cancelButton.setEnabled(True)
         # The CT and photopeak must not change underneath a running reconstruction
         for widget in (self.ctCombo, self.ctBrowseButton, self.peakCombo, self.saveDefaultsButton,
-                       self.restoreDefaultsButton, self.factoryDefaultsButton):
+                       self.restoreDefaultsButton, self.factoryDefaultsButton, self.motionButton):
             widget.setEnabled(not busy)
         for widget in (self.quantGroup, self.suvGroup):
             widget.setEnabled(not busy and (widget is not self.suvGroup or self.quantGroup.checked))
@@ -2115,7 +2148,8 @@ class SpectReconDialog:
         params = self.currentParams()
         self._setBusy(True)
         try:
-            if self.logic is None or self.logic.indexPeak != params["indexPeak"]:
+            if self.logic is None or self.logic.indexPeak != params["indexPeak"] or \
+                    self.logic.motionKey != params["motion"]:
                 if self.logic is not None:
                     self.logic.cleanup()
                     self.logic = None
@@ -2125,7 +2159,7 @@ class SpectReconDialog:
                 self.gateRawStats = []
                 self.gateReconKey = None
                 self.logic = SpectReconLogic(self.inputDcm, self.log, self.ctFiles, params["indexPeak"],
-                                             progress=self._progress,
+                                             motion=self.motion, progress=self._progress,
                                              shouldAbort=lambda: self.abortRequested)
             if self.logic.ctFiles != self.ctFiles:
                 self.logic.ctFiles = self.ctFiles
@@ -2177,6 +2211,7 @@ class SpectReconDialog:
                 # Multiply voxel values by this to get acquisition counts (used by SPECT Calibration)
                 "ToAcquisitionCounts": f"{stats['nViews'] / factor:.9g}" if units == "counts" else "n/a",
             }
+            self.info["MotionCorrection"] = motion.describe(*self.motion) if self.motion else "None"
             psf = self.psfArgument(params)
             self.info["ResolutionRecovery"] = collimators.describe(psf["entry"], psf["energyKeV"]) if psf else "None"
             if params["algorithm"] == ALGORITHM_BSREM:
@@ -2494,9 +2529,12 @@ class SpectReconDialog:
                 arr = np.atleast_1d(np.asarray(value))
                 return arr if arr.size == n else None
 
-            self.rawProjection = {"frames": frames, "ewv": vector("EnergyWindowVector"),
-                                  "det": vector("DetectorVector"), "gates": vector("TimeSlotVector"),
-                                  "views": vector("AngularViewVector")}
+            ewv, gates = vector("EnergyWindowVector"), vector("TimeSlotVector")
+            slots = motion.frameSlots(n, ewv, gates)
+            angles, slotDetectors = motion.slotGeometry(ds, int(slots.max()) + 1)
+            self.rawProjection = {"frames": frames, "ewv": ewv, "det": vector("DetectorVector"),
+                                  "gates": gates, "slots": slots, "angles": angles,
+                                  "slotDetectors": slotDetectors}
             self._showRawProjections()
         except Exception as e:
             self.projView.setText("Could not read projections")
@@ -2507,6 +2545,8 @@ class SpectReconDialog:
         """Show the frames of the current photopeak window, like the reconstruction."""
         raw = self.rawProjection
         frames = raw["frames"]
+        if self.motion is not None:
+            frames = motion.applyShifts(frames, raw["slots"], *self.motion).astype(np.float32)
         n = frames.shape[0]
         peakWindow = max(0, self.peakCombo.currentIndex) + 1
         sel = (raw["ewv"] == peakWindow) if raw["ewv"] is not None else np.ones(n, dtype=bool)
@@ -2519,8 +2559,8 @@ class SpectReconDialog:
         self.projMax = float(self.projArray.max()) if self.projArray.size else 1.0
         if self.projMax <= 0:
             self.projMax = 1.0
-        views = raw["views"][sel] if raw.get("views") is not None else None
-        self.sinoStack = sinogramStack(self.projArray, self.projDetectors, views)
+        stack = motion.slotStack(frames, raw["slots"], raw["ewv"], peakWindow)
+        self.sinoStack = stack[np.argsort(raw["angles"], kind="stable")]
         self.sinoMax = float(self.sinoStack.max()) if self.sinoStack.size else 1.0
         rowSums = self.sinoStack.sum(axis=(0, 2))
         self.projModeIndex.setdefault("Sinogram", int(np.argmax(rowSums)) if rowSums.size else 0)
