@@ -541,7 +541,7 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
             self.gatedSubsetsSpin.setToolTip("OSEM only; with BSREM or FBP the gates use the static settings")
-            self.gatedBetaSpin = _slider(0.0, 5.0, 0.01, 2, 1.0, "",
+            self.gatedBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.75, "",
                                          "BSREM prior strength for the gates (BSREM has no post-filter). Gates hold "
                                          "few counts, so a higher beta than the static image is usual; iterations, "
                                          "subsets and gamma are the static ones.")
