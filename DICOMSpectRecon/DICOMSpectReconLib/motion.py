@@ -339,3 +339,79 @@ def writeCorrectedFile(sourceFile, outPath, dx, dz):
     ds.is_implicit_VR = False
     ds.save_as(outPath, write_like_original=False)
     return outPath
+
+
+# ---------------------------------------------------------------------------
+# Fast 2D reconstruction of one axial slice (one projection row), for the live preview
+# ---------------------------------------------------------------------------
+SLICE_MAX_BINS = 128
+SLICE_ITERATIONS = 3
+SLICE_SUBSETS = 6
+
+
+class SliceReconstructor:
+    """OSEM of a single projection row (a 1 pixel thick axial slice) with a parallel-hole
+    line-integral projector: no attenuation, scatter or resolution recovery, so it is quick
+    enough to follow the motion correction live. Wide projections are binned to at most
+    SLICE_MAX_BINS pixels."""
+
+    def __init__(self, angles, nBins, iterations=SLICE_ITERATIONS, subsets=SLICE_SUBSETS):
+        self.binning = int(np.ceil(nBins / SLICE_MAX_BINS))
+        self.nBins = nBins
+        n = int(np.ceil(nBins / self.binning))
+        self.n = n
+        self.iterations = iterations
+        theta = np.deg2rad(np.asarray(angles, dtype=np.float64))
+        centre = (n - 1) / 2.0
+        u = np.arange(n) - centre
+        t = np.arange(n) - centre
+        cos, sin = np.cos(theta)[:, None, None], np.sin(theta)[:, None, None]
+        x = u[None, :, None] * cos - t[None, None, :] * sin + centre
+        y = centre - (u[None, :, None] * sin + t[None, None, :] * cos)
+        x0, y0 = np.floor(x), np.floor(y)
+        fx, fy = (x - x0).astype(np.float32), (y - y0).astype(np.float32)
+        x0, y0 = x0.astype(np.int64), y0.astype(np.int64)
+        indices, weights = [], []
+        for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx),
+                          (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+            yy, xx = y0 + dy, x0 + dx
+            inside = (yy >= 0) & (yy < n) & (xx >= 0) & (xx < n)
+            indices.append(np.where(inside, yy * n + xx, 0).astype(np.int32))
+            weights.append(np.where(inside, w, 0.0).astype(np.float32))
+        self.index = np.stack(indices, axis=-1)    # [angle, bin, depth, 4]
+        self.weight = np.stack(weights, axis=-1)
+        nAngles = len(theta)
+        subsets = max(1, min(subsets, nAngles // 4))
+        self.subsets = [np.arange(s, nAngles, subsets) for s in range(subsets)]
+        self.sensitivity = [np.maximum(self._back(np.ones((len(a), n), np.float32), a), 1e-6)
+                            for a in self.subsets]
+        yy, xx = np.mgrid[0:n, 0:n] - centre
+        self.fov = (xx ** 2 + yy ** 2 <= (n / 2.0) ** 2).astype(np.float32)
+
+    def _forward(self, image, angles):
+        flat = image.ravel()
+        return (flat[self.index[angles]] * self.weight[angles]).sum(axis=(2, 3))
+
+    def _back(self, projection, angles):
+        weights = self.weight[angles] * projection[:, :, None, None]
+        out = np.bincount(self.index[angles].ravel(), weights=weights.ravel(), minlength=self.n * self.n)
+        return out.reshape(self.n, self.n).astype(np.float32)
+
+    def _bin(self, sinogram):
+        sinogram = np.asarray(sinogram, dtype=np.float32)
+        if self.binning == 1:
+            return sinogram
+        pad = self.n * self.binning - sinogram.shape[1]
+        sinogram = np.pad(sinogram, ((0, 0), (0, pad)))
+        return sinogram.reshape(sinogram.shape[0], self.n, self.binning).sum(axis=2)
+
+    def reconstruct(self, sinogram):
+        """sinogram [angle, bin] (angles as given to the constructor) -> image [n, n]."""
+        data = self._bin(sinogram)
+        image = self.fov.copy()
+        for _ in range(self.iterations):
+            for angles, sensitivity in zip(self.subsets, self.sensitivity):
+                estimate = np.maximum(self._forward(image, angles), 1e-6)
+                image *= self._back(data[angles] / estimate, angles) / sensitivity
+                image *= self.fov
+        return image
