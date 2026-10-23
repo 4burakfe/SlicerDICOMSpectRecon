@@ -32,6 +32,12 @@ Author: Burak Demir, MD, FEBNM
   camera software). Scatter is subtracted from the projections and attenuation is corrected with the
   first order Chang method from the CT. The image is in the same units as OSEM; negative values are set
   to 0.
+- **Resolution recovery** (OSEM and BSREM): the depth dependent collimator-detector blur is modelled in
+  the system matrix (Gaussian PSF, sigma(d) = sqrt((d_hole / L_eff x d + d_hole)^2 + intrinsic^2), with
+  L_eff = L - 2 / mu_lead at the photopeak energy), as in vendor resolution recovery. The collimator is
+  matched from the DICOM header (manufacturer, camera model, collimator name; e.g. a GE NM/CT 850/860/870
+  "LEHRS" gets G8-LHRS: 1.43 mm holes, 0.13 mm septa, 32 mm long) or picked by hand. It raises contrast
+  recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
 - **Scatter correction** with dual or triple energy windows, chosen from the acquisition's windows.
@@ -67,6 +73,15 @@ Author: Burak Demir, MD, FEBNM
 3. Compute and save the calibration factor; the reconstruction window then offers it under
    *Quantification*.
 
+### SPECT Collimators module
+
+*Nuclear Medicine > SPECT Collimators* edits the collimator library used for resolution recovery (a JSON
+file next to Slicer's settings). It starts with the parallel-hole collimators that PyTomography ships
+(from the SIMIND data base) and shows each one's system resolution at 10 cm / 140 keV to compare with the
+datasheet. Add, Duplicate, Delete and edit the cells, then **Save**; **Restore defaults** puts back the
+built-in list. *Test header matching* shows which collimator a header (manufacturer, model, collimator
+name) gets. Reconstruction windows read the library when they open.
+
 ## Requirements
 
 PyTorch comes from Slicer's **PyTorch** extension (installed as a dependency, the module offers to install
@@ -80,10 +95,12 @@ CMakeLists.txt                 extension (depends on the PyTorch extension)
 DICOMSpectRecon/
   DICOMSpectRecon.py           hidden module that registers the DICOM plugin
   SPECTCalibration.py          calibration module (Nuclear Medicine category)
+  SPECTCollimators.py          collimator library module (Nuclear Medicine category)
   DICOMSpectReconLib/
     nmdata.py                  NM header, energy windows, gating (incl. ECG R-R / beats), CT matching
     reconstruction.py          PyTomography OSEM, BSREM and FBP, count scaling, post-filters
     quantification.py          calibration factors, Bq/ml, SUV, calibration library
+    collimators.py             collimator library, header matching, resolution recovery PSF
     display.py                 in-memory previews
     dialog.py                  reconstruction window
   Resources/Icons/

@@ -490,6 +490,7 @@ def evaluatePhantom(attributes, voiSum, imageSum, activityMBq, measuredTime, mid
         "recon": {"algorithm": attributes.get("ReconAlgorithm") or "OSEM",
                   "iterations": int(_number(attributes.get("ReconIterations"), 0) or 0) or None,
                   "subsets": int(_number(attributes.get("ReconSubsets"), 0) or 0) or None,
+                  "resolutionRecovery": attributes.get("ReconResolutionRecovery", ""),
                   "postFilter": attributes.get("PostFilter", ""),
                   "pytomography": attributes.get("PyTomographyVersion", "")},
         "cpsPerMBq": cf,

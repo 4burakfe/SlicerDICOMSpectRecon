@@ -343,12 +343,14 @@ class SpectReconLogic:
                      "(metal, contrast or a CT that is not in HU?).")
 
     def reconstruct(self, iters, subsets, useAttenuationCorrection=False,
-                    scatter=None, projectionSet=None, algorithm=ALGORITHM_OSEM, fbp=None, bsrem=None):
+                    scatter=None, projectionSet=None, algorithm=ALGORITHM_OSEM, fbp=None, bsrem=None, psf=None):
         """OSEM or FBP reconstruction in PyTomography's native units (counts per voxel per view).
         scatter: None, or (indexLower, indexUpper[, weight]) with indexUpper possibly None (dual
         window) and weight None (automatic) or a manual dual window scatter weight.
         bsrem (BSREM only): {"beta", "gamma"} of the relative difference prior; iters and subsets are
         the BSREM ones.
+        psf (OSEM and BSREM): None, or {"entry": collimator library entry, "energyKeV": photopeak}
+        for resolution recovery (collimator-detector response in the system matrix).
         fbp (FBP only): {"window", "cutoff" (cycles/cm), "order"}. FBP subtracts the scatter estimate
         from the projections and corrects attenuation with the first order Chang method.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
@@ -379,6 +381,14 @@ class SpectReconLogic:
             if useAttenuationCorrection:
                 from pytomography.transforms.SPECT import SPECTAttenuationTransform
                 obj2obj_transforms.append(SPECTAttenuationTransform(self.getAttenuationMap()))
+            if psf is not None:
+                if algorithm == ALGORITHM_FBP:
+                    self.log("  -> Resolution recovery is not used with FBP (iterative algorithms only).")
+                else:
+                    from . import collimators
+                    entry, energyKeV = psf["entry"], float(psf["energyKeV"])
+                    self.log(f"Resolution recovery: {collimators.describe(entry, energyKeV)}")
+                    obj2obj_transforms.append(collimators.psfTransform(entry, energyKeV))
 
             photopeakCounts = float(projectionSet.projections.sum().item())
             additive_term = None
@@ -403,8 +413,11 @@ class SpectReconLogic:
                              "check that the scatter windows are the right ones.")
 
             # 2. Build System Matrix
+            corrections = [name for name, used in (("attenuation correction", useAttenuationCorrection),
+                                                    ("resolution recovery", psf is not None
+                                                     and algorithm != ALGORITHM_FBP)) if used]
             self.log("Building System Matrix"
-                     + (" (with attenuation correction)..." if useAttenuationCorrection else "..."))
+                     + (f" (with {' and '.join(corrections)})..." if corrections else "..."))
             system_matrix = SPECTSystemMatrix(
                 obj2obj_transforms=obj2obj_transforms,
                 proj2proj_transforms=[],
