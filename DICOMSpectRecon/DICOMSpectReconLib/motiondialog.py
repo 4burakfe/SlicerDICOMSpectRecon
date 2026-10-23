@@ -130,8 +130,9 @@ class MotionCorrectionWindow:
         views.addLayout(sliders, 3, 1, 1, 3)
         caption = qt.QLabel("Projections and sinogram rows run along the rotation, first view at the top of the "
                             "sinogram; the linogram (axial profile) has the views left to right and axial row 1 "
-                            "at the top. Photopeak window, gates summed. The dashed line on the projections "
-                            "marks the sinogram row.")
+                            "at the top. Photopeak window, gates summed. Drag the yellow line on the projections "
+                            "(left mouse button) to pick the sinogram row; every view is scaled to the "
+                            "maximum on that line.")
         caption.setWordWrap(True)
         caption.setStyleSheet("color: gray;")
         views.addWidget(caption, 4, 1, 1, 3)
@@ -143,6 +144,10 @@ class MotionCorrectionWindow:
                            "0 and &plusmn;1 pixel, white lines between detectors.")
         legend.setWordWrap(True)
         views.addWidget(legend, 6, 1, 1, 3)
+
+        self.lineFilters = []
+        for kind in ("original", "corrected"):
+            self._installLineDrag(self.views[(kind, "projection")])
 
         self.cineTimer = qt.QTimer()
         self.cineTimer.setInterval(CINE_INTERVAL_MS)
@@ -225,6 +230,19 @@ class MotionCorrectionWindow:
         buttons.addWidget(cancelButton)
         side.addLayout(buttons)
 
+    def _installLineDrag(self, view):
+        from .dialog import LineDragFilter
+        rows = self.stack.shape[1]
+
+        def move(y):
+            self.rowSlider.setValue(int(min(rows - 1, max(0, y / VIEW_SIZE * rows))))
+        try:
+            lineFilter = LineDragFilter(move)
+            view.installEventFilter(lineFilter)
+            self.lineFilters.append(lineFilter)  # keep alive
+        except Exception:
+            self.log("Reference line dragging not available")
+
     @staticmethod
     def _doubleSpin(minimum, maximum, step, value, suffix, tooltip):
         spin = qt.QDoubleSpinBox()
@@ -280,8 +298,9 @@ class MotionCorrectionWindow:
         row = self.rowSlider.value
         self.rowLabel.setText(f"{row + 1} / {self.stack.shape[1]}")
         original, corrected = self.stack[self.order], self.corrected[self.order]
-        sinoMax = float(original[:, row, :].max())
-        linoMax = float(original.sum(axis=2).max())
+        line = original[:, row, :]  # the reference line on every projection sets the display maxima
+        sinoMax = float(line.max())
+        linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
             self.views[(kind, "sinogram")].setPixmap(self._colour(data[:, row, :], sinoMax))
             self.views[(kind, "linogram")].setPixmap(self._colour(data.sum(axis=2).T, linoMax))
@@ -291,13 +310,11 @@ class MotionCorrectionWindow:
         index = min(self.projSlider.value, self.stack.shape[0] - 1)
         slot = int(self.order[index])
         self.projLabel.setText(f"{index + 1} / {self.stack.shape[0]}  (detector {int(self.slotDetectors[slot])})")
-        projMax = float(self.stack.max()) or 1.0
-        rows = self.stack.shape[1]
-        y = int(round((self.rowSlider.value + 0.5) * VIEW_SIZE / rows))
+        row, rows = self.rowSlider.value, self.stack.shape[1]
+        projMax = float(self.stack[:, row, :].max()) or float(self.stack.max()) or 1.0
         for kind, data in (("original", self.stack), ("corrected", self.corrected)):
             rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax)
-            dashes = (np.arange(VIEW_SIZE) // 6) % 2 == 0
-            rgb[min(y, VIEW_SIZE - 1), dashes] = (255, 150, 40)
+            display.drawLine(rgb, row, rows)
             self.views[(kind, "projection")].setPixmap(self.renderer.toPixmap(rgb))
 
     def _onCineToggled(self, on):

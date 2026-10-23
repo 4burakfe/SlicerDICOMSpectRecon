@@ -79,7 +79,10 @@ Next to the raw projections the window shows a **sinogram** (one projection row 
 order of the rotation, first view at the top; a sideways patient movement shows as a jump in the sine
 curves) and a **linogram** (the axial count profile of every view, views left to right; an up/down
 movement shows as a step), in PET-DICOM colours and stretched to the square panel, with the gates of a
-gated study summed. They sit in a row below the previews, or in a column on the right when a CT is shown. On every preview,
+gated study summed. They sit in a row below the previews, or in a column on the right when a CT is shown. A yellow
+line over the rotating projections (drag it with the left mouse button) picks the sinogram row, and every
+display window (projections, sinogram, linogram and the reconstruction slice at that height) is scaled to
+the maximum on that line; the motion correction window has the same line. On every preview,
 drag with the **middle mouse button** to change the display window (left/right: width, up/down: level);
 a middle double-click resets it.
 
