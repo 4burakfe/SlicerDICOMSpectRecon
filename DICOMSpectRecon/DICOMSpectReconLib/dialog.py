@@ -17,10 +17,12 @@ from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, ALGORITHM_OSEM, ALG
                              SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
                              applyFilter, autoScatterWeight, cutoffFraction, fbpDescription, filterDescription,
                              pytomographyVersion, scaleCounts, scatterDescription)
+from . import collimators
 from . import display
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
+RR_AUTO = "Auto"
 DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
 
@@ -482,6 +484,17 @@ class SpectReconDialog:
                                      "1 / (2 x pixel size in cm). Ramp at Nyquist is the unfiltered FBP.")
         self.fbpCutoffNyquistLabel = qt.QLabel()
         self.fbpOrderSpin = _slider(1, 20, 1, 0, 10, "", "Butterworth order: higher is a sharper roll-off")
+        self.rrCheckBox = qt.QCheckBox("Resolution recovery")
+        self.rrCheckBox.setToolTip(
+            "Model the collimator-detector blur (depth dependent Gaussian PSF) in OSEM / BSREM, like vendor "
+            "resolution recovery (Evolution, Flash3D, Astonish). Sharper, higher contrast, more edge ringing; "
+            "needs more iterations to converge. The collimator comes from the SPECT Collimators library.")
+        self.rrCombo = _compactCombo()
+        self.rrCombo.setToolTip("Auto: matched from the camera model and the collimator name in the DICOM "
+                                "header. Edit or add collimators in the SPECT Collimators module.")
+        self.rrNote = qt.QLabel("")
+        self.rrNote.setWordWrap(True)
+        self._loadCollimators()
         self.reconRows = {}
         for row, (key, label, widget) in enumerate([
                 ("algorithm", "Algorithm:", self.algorithmCombo),
@@ -489,12 +502,15 @@ class SpectReconDialog:
                 ("subsets", "Subsets:", self.subsetsSpin),
                 ("bsrem", "Beta:", self.bsremBetaSpin), ("bsrem", "Gamma:", self.bsremGammaSpin),
                 ("fbp", "Window:", self.fbpWindowCombo), ("fbp", "Cutoff:", self.fbpCutoffSpin),
-                ("fbp", "", self.fbpCutoffNyquistLabel), ("fbpOrder", "Order:", self.fbpOrderSpin)]):
+                ("fbp", "", self.fbpCutoffNyquistLabel), ("fbpOrder", "Order:", self.fbpOrderSpin),
+                ("rr", "", self.rrCheckBox), ("rr", "Collimator:", self.rrCombo), ("rr", "", self.rrNote)]):
             labelWidget = qt.QLabel(label)
             reconForm.addWidget(labelWidget, row, 0)
             reconForm.addWidget(widget, row, 1)
             self.reconRows.setdefault(key, []).extend([labelWidget, widget])
-        reconForm.setRowStretch(10, 1)
+        reconForm.setRowStretch(13, 1)
+        self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateRrNote())
+        self.rrCombo.connect("currentIndexChanged(int)", lambda index: self._updateRrNote())
         self.fbpCutoffSpin.connect("valueChanged(double)", lambda v: self._showNyquistFraction(
             self.fbpCutoffSpin, self.fbpCutoffNyquistLabel))
         self._showNyquistFraction(self.fbpCutoffSpin, self.fbpCutoffNyquistLabel)
@@ -647,6 +663,7 @@ class SpectReconDialog:
         scatterForm.setRowStretch(6, 1)
         side.addLayout(_row(acGroup, scatterGroup))
         self.peakCombo.connect("currentIndexChanged(int)", self.onPeakWindowChanged)
+        self.peakCombo.connect("currentIndexChanged(int)", lambda index: self._updateRrNote())
         self.scatterCheckBox.connect("toggled(bool)", lambda checked: self._updateScatterState())
         self.lowerCombo.connect("currentIndexChanged(int)", lambda index: self._updateScatterState())
         self.upperCombo.connect("currentIndexChanged(int)", lambda index: self._updateScatterState())
@@ -735,6 +752,7 @@ class SpectReconDialog:
 
         self._watchSettings()
         self._updateCtState()
+        self._updateRrNote()
         self.factoryDefaults = self._defaultsValues()
         saved = self._savedDefaults()
         if saved:
@@ -752,7 +770,8 @@ class SpectReconDialog:
                    ("bsremGamma", self.bsremGammaSpin), ("fbpWindow", self.fbpWindowCombo),
                    ("fbpCutoff", self.fbpCutoffSpin), ("fbpOrder", self.fbpOrderSpin),
                    ("filter", self.filterCombo), ("fwhm", self.fwhmSpin), ("cutoff", self.cutoffSpin),
-                   ("order", self.orderSpin), ("scaling", self.scalingCombo),
+                   ("order", self.orderSpin), ("resolutionRecovery", self.rrCheckBox),
+                   ("collimator", self.rrCombo), ("scaling", self.scalingCombo),
                    ("attenuationCorrection", self.acCheckBox), ("showOnCt", self.showOnCtCheckBox),
                    ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin)]
         if self.isGated:
@@ -1060,6 +1079,12 @@ class SpectReconDialog:
                 (self.itersSpin.value, self.subsetsSpin.value):
             warnings.append(f"calibrated with {recon.get('iterations')} iterations x {recon.get('subsets')} "
                             f"subsets, current {self.itersSpin.value} x {self.subsetsSpin.value}")
+        calibratedRr = recon.get("resolutionRecovery") or ""
+        currentRr = ""
+        if self.rrCheckBox.checked and self.algorithmCombo.currentText in ITERATIVE_ALGORITHMS:
+            currentRr = (self.selectedCollimator() or {}).get("code", "?")
+        if calibratedRr != currentRr:
+            warnings.append(f"calibrated with resolution recovery {calibratedRr or 'off'}, current {currentRr or 'off'}")
         text = (f"{float(calibration.get('cpsPerMBq', 0)):.3f} cps/MBq, AC CT, "
                 f"SC {quant.scatterLabel(calibration)}")
         if errors:
@@ -1182,6 +1207,7 @@ class SpectReconDialog:
             "ScatterLowerRange": energyRange(params["indexLower"]) if params["indexLower"] is not None else "",
             "ScatterUpperRange": energyRange(params["indexUpper"]) if params["indexUpper"] is not None else "",
             "ReconAlgorithm": params["algorithm"],
+            "ReconResolutionRecovery": self.psfArgument(params)["entry"]["code"] if self.psfArgument(params) else "",
             "ReconIterations": self.reconIterations(params)[0] or "",
             "ReconSubsets": self.reconIterations(params)[1] or "",
         }
@@ -1523,7 +1549,8 @@ class SpectReconDialog:
         fbp = algorithm == ALGORITHM_FBP
         for key, visible in (("osem", algorithm == ALGORITHM_OSEM), ("bsrem", algorithm == ALGORITHM_BSREM),
                              ("subsets", algorithm in ITERATIVE_ALGORITHMS), ("fbp", fbp),
-                             ("fbpOrder", fbp and self.fbpWindowCombo.currentText in FBP_WINDOWS_WITH_ORDER)):
+                             ("fbpOrder", fbp and self.fbpWindowCombo.currentText in FBP_WINDOWS_WITH_ORDER),
+                             ("rr", algorithm in ITERATIVE_ALGORITHMS)):
             for widget in self.reconRows[key]:
                 widget.setVisible(visible)
         if self.isGated:
@@ -1531,6 +1558,77 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setEnabled(algorithm == ALGORITHM_OSEM)
             for widget in (self.gatedBetaLabel, self.gatedBetaSpin, self.gatedGammaLabel, self.gatedGammaSpin):
                 widget.setVisible(algorithm == ALGORITHM_BSREM)
+
+    # ---------------- resolution recovery ----------------
+    def _loadCollimators(self):
+        """Collimator library and the entry matched to this study's header; fills the combo."""
+        try:
+            self.collimatorLibrary = collimators.loadLibrary()
+        except Exception as e:
+            logging.warning("Could not read the collimator library:\n" + traceback.format_exc())
+            self.collimatorLibrary = collimators.builtinCollimators()
+            self.collimatorLibraryError = str(e)
+        else:
+            self.collimatorLibraryError = ""
+        acq = self.acquisition
+        self.matchedCollimator = collimators.matchCollimator(
+            self.collimatorLibrary, acq.get("manufacturer"), acq.get("model"), acq.get("collimator"))
+        self.rrCombo.clear()
+        self.rrCombo.addItem(RR_AUTO)
+        for entry in self.collimatorLibrary:
+            self.rrCombo.addItem(entry["code"])
+            if entry["description"]:
+                self.rrCombo.setItemData(self.rrCombo.count - 1, entry["description"], qt.Qt.ToolTipRole)
+
+    def _photopeakKeV(self, indexPeak=None):
+        index = max(0, self.peakCombo.currentIndex) if indexPeak is None else indexPeak
+        if 0 <= index < len(self.energyWindows):
+            return self.energyWindows[index].get("center")
+        return None
+
+    def selectedCollimator(self):
+        """The library entry used for resolution recovery (Auto: the header match), or None."""
+        if self.rrCombo.currentText == RR_AUTO:
+            return self.matchedCollimator
+        return collimators.findEntry(self.collimatorLibrary, self.rrCombo.currentText)
+
+    def _updateRrNote(self):
+        if not hasattr(self, "peakCombo"):
+            return
+        acq = self.acquisition
+        header = acq.get("collimator") or "not recorded"
+        entry = self.selectedCollimator()
+        if self.collimatorLibraryError:
+            text = f"<span style='color:#d04040'>Library could not be read ({self.collimatorLibraryError}); " \
+                   "using the built-in collimators.</span><br>"
+        else:
+            text = ""
+        if entry is None:
+            colour = "#d04040" if self.rrCheckBox.checked else "#808080"
+            text += (f"<span style='color:{colour}'>No library collimator for '{header}' "
+                     f"({acq.get('manufacturer', '')} {acq.get('model', '')}) - choose one, or add it in the "
+                     "SPECT Collimators module.</span>")
+        else:
+            energy = self._photopeakKeV()
+            text += f"{'Matched' if self.rrCombo.currentText == RR_AUTO else 'Using'} {entry['code']} " \
+                    f"(header: {header})"
+            try:
+                text += f", {collimators.systemResolutionMm(entry):.1f} mm FWHM at 10 cm"
+                if energy:
+                    collimators.psfParameters(entry, energy)
+            except Exception as e:
+                text += f"<br><span style='color:#d04040'>{e}</span>"
+        self.rrNote.setText(text)
+        if hasattr(self, "quantGroup") and self.selectedCalibration() is not None:
+            self._applyCalibration()  # refresh the resolution recovery mismatch warning
+
+    def rrParams(self, indexPeak):
+        """{"code", "entry", "energyKeV"} for resolution recovery, or None when it is off."""
+        if not self.rrCheckBox.checked:
+            return None
+        entry = self.selectedCollimator()
+        return {"code": entry["code"] if entry else None, "entry": entry,
+                "energyKeV": self._photopeakKeV(indexPeak)}
 
     def _showNyquistFraction(self, slider, label):
         """What a cutoff in cycles/cm is on this study's pixels."""
@@ -1570,6 +1668,7 @@ class SpectReconDialog:
             "scatterWeight": None,
             "gated": False,
         }
+        params["psf"] = self.rrParams(params["indexPeak"])
         if self._scatterAvailable() and self.scatterCheckBox.checked:
             lower = self.lowerCombo.currentIndex - 1
             upper = self.upperCombo.currentIndex - 1
@@ -1648,8 +1747,20 @@ class SpectReconDialog:
                 bsrem = cls.bsremParams(params, gated)
                 settings += (bsrem["beta"], bsrem["gamma"])
         ctId = params["ctId"] if params["attenuationCorrection"] else None
+        psf = cls.psfArgument(params)
+        if psf is not None:
+            entry = psf["entry"]
+            settings += (tuple(entry[k] for k in collimators.NUMERIC_FIELDS), psf["energyKeV"])
         return (params["algorithm"], settings, params["attenuationCorrection"], ctId, params["indexPeak"],
                 params["indexLower"], params["indexUpper"], params.get("scatterWeight"), prefix)
+
+    @staticmethod
+    def psfArgument(params):
+        """Resolution recovery settings for reconstruct(): None when off or with FBP."""
+        psf = params.get("psf")
+        if psf is None or params["algorithm"] not in ITERATIVE_ALGORITHMS:
+            return None
+        return {"entry": psf["entry"], "energyKeV": psf["energyKeV"]}
 
     @staticmethod
     def filterParams(params, gated=False):
@@ -1799,6 +1910,15 @@ class SpectReconDialog:
                 if params["algorithm"] == ALGORITHM_OSEM and iters and subsets and iters * subsets > 120:
                     self.log(f"Note: {iters} x {subsets} = {iters * subsets} subset updates ({what}) - "
                              "images will be noisy and slow; 2-4 iterations with 6-10 subsets is usual.")
+        psf = params.get("psf")
+        if psf is not None and params["algorithm"] in ITERATIVE_ALGORITHMS:
+            if psf["entry"] is None:
+                raise ValueError("Resolution recovery is on, but no collimator from the library matches "
+                                 f"'{self.acquisition.get('collimator') or 'not recorded'}' - choose one in the "
+                                 "Collimator list (or add it in the SPECT Collimators module).")
+            if not psf["energyKeV"]:
+                raise ValueError("Resolution recovery needs the photopeak energy, which the header does not give.")
+            collimators.psfParameters(psf["entry"], psf["energyKeV"])  # raises for an unusable collimator
         return params
 
     def onApply(self):
@@ -1831,7 +1951,8 @@ class SpectReconDialog:
                 iters, subsets = self.reconIterations(params)
                 self.reconImage, self.reconStats = self.logic.reconstruct(
                     iters, subsets, params["attenuationCorrection"], scatter,
-                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"])
+                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"],
+                    psf=self.psfArgument(params))
                 self.reconKey = key
             else:
                 self.log("Static reconstruction settings unchanged - re-scaling/re-filtering existing reconstruction.")
@@ -1865,6 +1986,8 @@ class SpectReconDialog:
                 # Multiply voxel values by this to get acquisition counts (used by SPECT Calibration)
                 "ToAcquisitionCounts": f"{stats['nViews'] / factor:.9g}" if units == "counts" else "n/a",
             }
+            psf = self.psfArgument(params)
+            self.info["ResolutionRecovery"] = collimators.describe(psf["entry"], psf["energyKeV"]) if psf else "None"
             if params["algorithm"] == ALGORITHM_BSREM:
                 self.info["Prior"] = bsremDescription(params["bsrem"])
             if params["algorithm"] == ALGORITHM_FBP:
@@ -1925,7 +2048,8 @@ class SpectReconDialog:
                 iters, subsets = self.reconIterations(params, gated=True)
                 image, gateStats = self.logic.reconstruct(
                     iters, subsets, params["attenuationCorrection"], scatter, projectionSet=projectionSet,
-                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=self.bsremParams(params, gated=True))
+                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=self.bsremParams(params, gated=True),
+                    psf=self.psfArgument(params))
                 images.append(image)
                 stats.append(gateStats)
             self.gateRawImages, self.gateRawStats = images, stats
@@ -2013,7 +2137,7 @@ class SpectReconDialog:
         watched = [self.algorithmCombo, self.itersSpin, self.subsetsSpin, self.bsremItersSpin,
                    self.bsremBetaSpin, self.bsremGammaSpin, self.fbpWindowCombo,
                    self.fbpCutoffSpin, self.fbpOrderSpin, self.filterCombo, self.fwhmSpin, self.cutoffSpin,
-                   self.orderSpin, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
+                   self.orderSpin, self.rrCheckBox, self.rrCombo, self.scalingCombo, self.acCheckBox, self.ctCombo, self.scatterCheckBox,
                    self.peakCombo, self.lowerCombo, self.upperCombo, self.scatterWeightSpin,
                    self.quantGroup, self.calibrationCombo,
                    self.durationSpin, self.midTimeEdit, self.midTimeFromDicom, self.suvGroup, self.suvTypeCombo,
