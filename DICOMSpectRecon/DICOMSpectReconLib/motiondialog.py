@@ -1,5 +1,6 @@
-"""Motion correction window: automatic and manual shifts of the projections, with the sinogram and
-linogram before and after the correction and a plot of the shifts."""
+"""Motion correction window: automatic and manual shifts of the projections. The original projections
+(cine), sinogram and linogram are shown on the top row, the motion corrected ones below, with a plot
+of the shifts."""
 
 import numpy as np
 import qt
@@ -7,8 +8,10 @@ import qt
 from . import display
 from . import motion
 
-VIEW_SIZE = 300
+VIEW_SIZE = 260
 PLOT_HEIGHT = 170
+PLOT_WIDTH = 3 * VIEW_SIZE + 20
+CINE_INTERVAL_MS = 120
 DX_COLOUR = (255, 150, 40)    # lateral
 DZ_COLOUR = (60, 200, 255)    # axial
 
@@ -54,7 +57,7 @@ class MotionCorrectionWindow:
     """Modal window. exec() returns (dx, dz) per slot when the user accepts, else None."""
 
     def __init__(self, parent, frames, slots, energyWindows, peakWindow, angles, slotDetectors,
-                 pixelMm=None, initial=None, log=print):
+                 clockwise=True, pixelMm=None, initial=None, log=print):
         self.log = log
         self.slots = slots
         self.slotDetectors = np.asarray(slotDetectors, dtype=int)
@@ -62,15 +65,16 @@ class MotionCorrectionWindow:
         self.times = motion.timeIndex(self.slotDetectors)
         self.pixelMm = pixelMm
         self.stack = motion.slotStack(frames, slots, energyWindows, peakWindow)
-        self.order = np.argsort(self.angles, kind="stable")  # sinogram rows by angle
+        self.order = motion.displayOrder(self.angles, clockwise)  # views along the rotation
         n = self.stack.shape[0]
         if initial is not None and len(initial[0]) == n:
             self.dx, self.dz = np.array(initial[0], dtype=float), np.array(initial[1], dtype=float)
         else:
             self.dx, self.dz = np.zeros(n), np.zeros(n)
         self.corrected = None
+        self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
-        self.plotRenderer = display.PixmapRenderer(2 * VIEW_SIZE + 10)
+        self.plotRenderer = display.PixmapRenderer(PLOT_WIDTH)
         self._build(parent)
         self._refresh()
 
@@ -84,41 +88,65 @@ class MotionCorrectionWindow:
         views = qt.QGridLayout()
         layout.addLayout(views, 1)
         self.views = {}
-        for column, title in enumerate(("Before", "After")):
+        for column, title in enumerate(("Projection", "Sinogram", "Linogram")):
             header = qt.QLabel(f"<b>{title}</b>")
             header.setAlignment(qt.Qt.AlignCenter)
-            views.addWidget(header, 0, column)
-            for row, kind in ((1, "sinogram"), (2, "linogram")):
+            views.addWidget(header, 0, column + 1)
+        for row, (kind, title) in enumerate((("original", "Original"), ("corrected", "Motion<br>corrected"))):
+            label = qt.QLabel(f"<b>{title}</b>")
+            label.setAlignment(qt.Qt.AlignCenter)
+            views.addWidget(label, row + 1, 0)
+            for column, image in enumerate(("projection", "sinogram", "linogram")):
                 view = qt.QLabel()
                 view.setFixedSize(VIEW_SIZE, VIEW_SIZE)
                 view.setAlignment(qt.Qt.AlignCenter)
                 view.setStyleSheet("background-color: black;")
-                views.addWidget(view, row, column)
-                self.views[(title, kind)] = view
-        rowLayout = qt.QHBoxLayout()
-        rowLayout.addWidget(qt.QLabel("Sinogram row:"))
+                views.addWidget(view, row + 1, column + 1)
+                self.views[(kind, image)] = view
+
+        sliders = qt.QGridLayout()
+        self.cineCheck = qt.QCheckBox("Cine")
+        self.cineCheck.setChecked(True)
+        self.cineCheck.setToolTip("Play the projections along the rotation")
+        self.cineCheck.connect("toggled(bool)", self._onCineToggled)
+        sliders.addWidget(self.cineCheck, 0, 0)
+        self.projSlider = qt.QSlider(qt.Qt.Horizontal)
+        self.projSlider.setRange(0, self.stack.shape[0] - 1)
+        self.projSlider.connect("valueChanged(int)", lambda value: self._refreshProjections())
+        self.projSlider.connect("sliderPressed()", lambda: self.cineCheck.setChecked(False))
+        sliders.addWidget(self.projSlider, 0, 1)
+        self.projLabel = qt.QLabel("")
+        sliders.addWidget(self.projLabel, 0, 2)
+        sliders.addWidget(qt.QLabel("Sinogram row:"), 1, 0)
         self.rowSlider = qt.QSlider(qt.Qt.Horizontal)
         self.rowSlider.setRange(0, self.stack.shape[1] - 1)
         rowSums = self.stack.sum(axis=(0, 2))
         self.rowSlider.setValue(int(np.argmax(rowSums)) if rowSums.size else 0)
         self.rowSlider.connect("valueChanged(int)", lambda value: self._refreshImages())
-        rowLayout.addWidget(self.rowSlider, 1)
+        sliders.addWidget(self.rowSlider, 1, 1)
         self.rowLabel = qt.QLabel("")
-        rowLayout.addWidget(self.rowLabel)
-        views.addLayout(rowLayout, 3, 0, 1, 2)
-        caption = qt.QLabel("Top: sinogram of the chosen row, bottom: linogram (axial profile, left = row 1). "
-                            "Angles run from top to bottom; gates are summed.")
+        sliders.addWidget(self.rowLabel, 1, 2)
+        sliders.setColumnStretch(1, 1)
+        views.addLayout(sliders, 3, 1, 1, 3)
+        caption = qt.QLabel("Projections and sinogram rows run along the rotation, first view at the top of the "
+                            "sinogram; the linogram (axial profile) has the views left to right and axial row 1 "
+                            "at the top. Photopeak window, gates summed. The dashed line on the projections "
+                            "marks the sinogram row.")
         caption.setWordWrap(True)
         caption.setStyleSheet("color: gray;")
-        views.addWidget(caption, 4, 0, 1, 2)
+        views.addWidget(caption, 4, 1, 1, 3)
         self.plotView = qt.QLabel()
-        self.plotView.setFixedSize(2 * VIEW_SIZE + 10, PLOT_HEIGHT)
-        views.addWidget(self.plotView, 5, 0, 1, 2)
+        self.plotView.setFixedSize(PLOT_WIDTH, PLOT_HEIGHT)
+        views.addWidget(self.plotView, 5, 1, 1, 3)
         legend = qt.QLabel("Shift per view (pixels) in acquisition order: <span style='color:#ff9628'>"
                            "lateral dx</span>, <span style='color:#3cc8ff'>axial dz</span>; grey lines at "
                            "0 and &plusmn;1 pixel, white lines between detectors.")
         legend.setWordWrap(True)
-        views.addWidget(legend, 6, 0, 1, 2)
+        views.addWidget(legend, 6, 1, 1, 3)
+
+        self.cineTimer = qt.QTimer()
+        self.cineTimer.setInterval(CINE_INTERVAL_MS)
+        self.cineTimer.connect("timeout()", self._cineStep)
 
         side = qt.QVBoxLayout()
         layout.addLayout(side, 0)
@@ -238,28 +266,59 @@ class MotionCorrectionWindow:
         self.corrected = motion.correctedStack(self.stack, self.dx, self.dz)
         self._refreshImages()
         self.plotView.setPixmap(self.plotRenderer.toPixmap(
-            shiftPlot(self.dx, self.dz, self.slotDetectors, 2 * VIEW_SIZE + 10)))
+            shiftPlot(self.dx, self.dz, self.slotDetectors, PLOT_WIDTH)))
         text = motion.describe(self.dx, self.dz)
         if self.pixelMm and text != "None":
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
+    def _colour(self, image, vmax):
+        """PET-coloured, stretched to the square view (aspect not kept)."""
+        return self.renderer.toPixmap(display.colorize(_fitTo(image, VIEW_SIZE), vmax or 1.0, self.petColors, 1.0))
+
     def _refreshImages(self):
         row = self.rowSlider.value
         self.rowLabel.setText(f"{row + 1} / {self.stack.shape[1]}")
-        before, after = self.stack[self.order], self.corrected[self.order]
-        sinoMax = float(before[:, row, :].max()) or 1.0
-        linoMax = float(before.sum(axis=2).max()) or 1.0
-        for title, data in (("Before", before), ("After", after)):
-            sinogram = _fitTo(data[:, row, :], VIEW_SIZE)
-            linogram = _fitTo(data.sum(axis=2), VIEW_SIZE)
-            self.views[(title, "sinogram")].setPixmap(self.renderer.toPixmap(display.grayscale(sinogram, sinoMax)))
-            self.views[(title, "linogram")].setPixmap(self.renderer.toPixmap(display.grayscale(linogram, linoMax)))
+        original, corrected = self.stack[self.order], self.corrected[self.order]
+        sinoMax = float(original[:, row, :].max())
+        linoMax = float(original.sum(axis=2).max())
+        for kind, data in (("original", original), ("corrected", corrected)):
+            self.views[(kind, "sinogram")].setPixmap(self._colour(data[:, row, :], sinoMax))
+            self.views[(kind, "linogram")].setPixmap(self._colour(data.sum(axis=2).T, linoMax))
+        self._refreshProjections()
+
+    def _refreshProjections(self):
+        index = min(self.projSlider.value, self.stack.shape[0] - 1)
+        slot = int(self.order[index])
+        self.projLabel.setText(f"{index + 1} / {self.stack.shape[0]}  (detector {int(self.slotDetectors[slot])})")
+        projMax = float(self.stack.max()) or 1.0
+        rows = self.stack.shape[1]
+        y = int(round((self.rowSlider.value + 0.5) * VIEW_SIZE / rows))
+        for kind, data in (("original", self.stack), ("corrected", self.corrected)):
+            rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax)
+            dashes = (np.arange(VIEW_SIZE) // 6) % 2 == 0
+            rgb[min(y, VIEW_SIZE - 1), dashes] = (255, 150, 40)
+            self.views[(kind, "projection")].setPixmap(self.renderer.toPixmap(rgb))
+
+    def _onCineToggled(self, on):
+        if on:
+            self.cineTimer.start()
+        else:
+            self.cineTimer.stop()
+
+    def _cineStep(self):
+        self.projSlider.blockSignals(True)
+        self.projSlider.setValue((self.projSlider.value + 1) % self.stack.shape[0])
+        self.projSlider.blockSignals(False)
+        self._refreshProjections()
 
     def exec(self):
+        if self.cineCheck.checked:
+            self.cineTimer.start()
         try:
             accepted = self.dialog.exec_() if hasattr(self.dialog, "exec_") else self.dialog.exec()
             return (self.dx.copy(), self.dz.copy()) if accepted else None
         finally:
+            self.cineTimer.stop()
             self.renderer.cleanup()
             self.plotRenderer.cleanup()

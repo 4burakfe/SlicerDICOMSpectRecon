@@ -40,8 +40,9 @@ Author: Burak Demir, MD, FEBNM
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
   While it is on, the iterations are multiplied by an "RR iterations" factor (x2 for OSEM, static and
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
-- **Motion correction** (orange *Motion correction...* button): a separate window shows the sinogram and
-  linogram before and after the correction and a plot of the shift of every view. *Detect* finds axial
+- **Motion correction** (orange *Motion correction...* button): a separate window shows the original
+  projections (in cine), sinogram and linogram on the top row and the motion corrected ones below,
+  with a plot of the shift of every view. *Detect* finds axial
   (up/down) movement by matching every view's axial count profile to the median profile, and sideways
   movement from the transaxial centre of mass, which follows a sinusoid over the angles until the
   patient moves (the acquisition is split in time where it jumps to another sinusoid, and the views are
@@ -74,9 +75,11 @@ Author: Burak Demir, MD, FEBNM
    and the settings (OSEM, BSREM or FBP, attenuation, scatter, filter, scaling, quantification).
 3. Press **Reconstruct**, check the preview, then **Load into Slicer**.
 
-The raw projection panel can also show a **sinogram** (one projection row for every angle; a sideways
-patient movement shows as a jump in the sine curves) or a **linogram** (the axial count profile of every
-angle; an up/down movement shows as a step), with the gates of a gated study summed. On every preview,
+Next to the raw projections the window shows a **sinogram** (one projection row for every view, in the
+order of the rotation, first view at the top; a sideways patient movement shows as a jump in the sine
+curves) and a **linogram** (the axial count profile of every view, views left to right; an up/down
+movement shows as a step), in PET-DICOM colours and stretched to the square panel, with the gates of a
+gated study summed. They sit in a row below the previews, or in a column on the right when a CT is shown. On every preview,
 drag with the **middle mouse button** to change the display window (left/right: width, up/down: level);
 a middle double-click resets it.
 

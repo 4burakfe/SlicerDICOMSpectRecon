@@ -23,10 +23,9 @@ from . import motion
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
-PROJ_MODES = ["Projections", "Sinogram", "Linogram"]
 # Display windows of the previews: activity and projections as (lower, upper) fractions of the
 # display reference, CT as (level, width) in HU
-DEFAULT_WINDOWS = {"activity": (0.0, display.WINDOW_FRACTION), "proj": (0.0, 1.0),
+DEFAULT_WINDOWS = {"activity": (0.0, display.WINDOW_FRACTION), "proj": (0.0, 1.0), "sino": (0.0, 1.0),
                    "ct": (display.CT_LEVEL, display.CT_WIDTH)}
 WINDOW_HINT = ("Middle mouse button on a preview: drag left/right for the window width, up/down for the "
                "level; double-click to reset.")
@@ -267,7 +266,6 @@ class SpectReconDialog:
         self.windows = dict(DEFAULT_WINDOWS)
         self.sinoStack = None        # photopeak projections by angle (gates summed): [angles, rows, cols]
         self.motion = None           # (dx, dz) pixel shifts per projection slot, or None
-        self.projModeIndex = {}      # slider position of each projection display mode
         self.logic = None
         self.reconImage = None       # unfiltered static recon in native units (cached)
         self.reconStats = None
@@ -352,7 +350,10 @@ class SpectReconDialog:
             return 1280, 800
 
     def _gridShape(self):
-        return (3 if self.isGated else 2), (2 if self.ctFiles else 1)
+        """(columns, rows) of preview panels. The sinogram and linogram get their own column on the
+        right when the CT panels make two rows, else a second row."""
+        columns = 3 if self.isGated else 2
+        return (columns + 1, 2) if self.ctFiles else (columns, 2)
 
     def _computeViewSize(self):
         """Largest panel size whose grid still fits on this screen without scrolling."""
@@ -432,29 +433,35 @@ class SpectReconDialog:
         self.fpsSpin.setValue(10)
         self.fpsSpin.setSuffix(" fps")
         self.fpsSpin.connect("valueChanged(int)", self.onFpsChanged)
-        self.projModeCombo = qt.QComboBox()
-        self.projModeCombo.addItems(PROJ_MODES)
-        self.projModeCombo.setToolTip(
-            "Projections: the raw frames.\n"
-            "Sinogram: one projection row (axial position, chosen with the slider) for every angle - "
-            "a sideways patient movement shows as a jump in the sine curves.\n"
-            "Linogram: every projection summed across, i.e. the axial count profile for every angle - "
-            "an up/down (axial) movement shows as a step. Gates are summed.")
-        self.projModeCombo.connect("currentIndexChanged(int)", lambda index: self._applyProjMode())
-        cineRow.addWidget(self.projModeCombo)
         cineRow.addWidget(self.cineCheckBox)
         cineRow.addWidget(self.fpsSpin)
         cineRow.addStretch(1)
         panels.addLayout(cineRow, 2, column)
 
+        # Sinogram and linogram: a column on the right next to the CT panels, else a row below
+        if self.ctFiles:
+            sinoPlace, linoPlace = (0, column + 1), (1, column + 1)
+            lastColumn, nextRow = column + 1, 3
+        else:
+            sinoPlace, linoPlace = (3, column - 1), (3, column)
+            lastColumn, nextRow = column, 4
+        self.sinoView, self.sinoSlider, self.sinoInfo, _ = self._makePanel(panels, "Sinogram", *sinoPlace)
+        self.linoView, _, self.linoInfo, _ = self._makePanel(panels, "Linogram", *linoPlace, withSlider=False)
+        self.sinoView.setToolTip("One projection row (axial position, chosen with the slider) for every angle, "
+                                 "first view at the top. A sideways patient movement shows as a jump in the "
+                                 "sine curves. Gates are summed.\n" + WINDOW_HINT)
+        self.linoView.setToolTip("Axial count profile (top = row 1) of every angle, side by side from left to "
+                                 "right. An up/down movement shows as a step. Gates are summed.\n" + WINDOW_HINT)
+
         self.windowHint = qt.QLabel(WINDOW_HINT)
         self.windowHint.setStyleSheet("color: gray;")
         self.windowHint.setAlignment(qt.Qt.AlignCenter)
         self.windowHint.setWordWrap(True)
-        panels.addWidget(self.windowHint, 3, 0, 1, column + 1)
+        panels.addWidget(self.windowHint, nextRow, 0, 1, lastColumn + 1)
 
         self.reconSlider.connect("valueChanged(int)", self.updateReconView)
         self.projSlider.connect("valueChanged(int)", self.updateProjView)
+        self.sinoSlider.connect("valueChanged(int)", self.updateSinoViews)
 
         # Mouse wheel over any axial panel scrolls through slices
         self._installWheelScroll(self.reconView, self.reconSlider)
@@ -469,6 +476,9 @@ class SpectReconDialog:
         for view in activityViews:
             self._installWindowDrag(view, "activity")
         self._installWindowDrag(self.projView, "proj")
+        self._installWindowDrag(self.sinoView, "sino")
+        self._installWindowDrag(self.linoView, "sino")
+        self._installWheelScroll(self.sinoView, self.sinoSlider)
         self._installWindowDrag(self.ctView, "ct")
 
         if not self.ctFiles:
@@ -1564,7 +1574,7 @@ class SpectReconDialog:
 
     def _installWheelScroll(self, view, slider, stopsCine=False):
         def step(direction):
-            if stopsCine and self.cineCheckBox.checked and self._projMode() == "Projections":
+            if stopsCine and self.cineCheckBox.checked:
                 self.cineCheckBox.setChecked(False)  # manual scrolling takes over
             if not slider.isEnabled():
                 return
@@ -1617,11 +1627,13 @@ class SpectReconDialog:
         if group == "ct":
             text = f"CT window: level {a:.0f} HU, width {b:.0f} HU"
         else:
-            name = "Activity" if group == "activity" else "Projection"
+            name = {"activity": "Activity", "proj": "Projection", "sino": "Sinogram / linogram"}[group]
             text = f"{name} window: {100 * a:.0f} % to {100 * b:.0f} % of the display maximum"
         self.windowHint.setText(text + "   (middle double-click resets)")
         if group == "proj":
             self.updateProjView(self.projSlider.value)
+        elif group == "sino":
+            self.updateSinoViews(self.sinoSlider.value)
         elif group == "activity":
             self.updateReconView(self.reconSlider.value)
         else:
@@ -1639,7 +1651,7 @@ class SpectReconDialog:
             self.projCineTimer.setInterval(int(1000 / max(1, fps)))
 
     def startProjCine(self):
-        if self.projArray is None or self.projArray.shape[0] < 2 or self._projMode() != "Projections":
+        if self.projArray is None or self.projArray.shape[0] < 2:
             return
         if self.projCineTimer is None:
             self.projCineTimer = qt.QTimer()
@@ -1652,7 +1664,7 @@ class SpectReconDialog:
             self.projCineTimer.stop()
 
     def advanceProjCine(self):
-        if self.projArray is None or self._projMode() != "Projections":
+        if self.projArray is None:
             return
         self.projSlider.setValue((self.projSlider.value + 1) % self.projArray.shape[0])
 
@@ -1816,7 +1828,8 @@ class SpectReconDialog:
         try:
             window = MotionCorrectionWindow(
                 self.dialog, raw["frames"], raw["slots"], raw["ewv"], max(0, self.peakCombo.currentIndex) + 1,
-                raw["angles"], raw["slotDetectors"], pixelMm=self.pixelMm, initial=self.motion, log=self.log)
+                raw["angles"], raw["slotDetectors"], clockwise=raw["clockwise"], pixelMm=self.pixelMm,
+                initial=self.motion, log=self.log)
             result = window.exec()
         except Exception as e:
             logging.error(traceback.format_exc())
@@ -2531,10 +2544,11 @@ class SpectReconDialog:
 
             ewv, gates = vector("EnergyWindowVector"), vector("TimeSlotVector")
             slots = motion.frameSlots(n, ewv, gates)
-            angles, slotDetectors = motion.slotGeometry(ds, int(slots.max()) + 1)
+            angles, slotDetectors, clockwise = motion.slotGeometry(ds, int(slots.max()) + 1)
             self.rawProjection = {"frames": frames, "ewv": ewv, "det": vector("DetectorVector"),
                                   "gates": gates, "slots": slots, "angles": angles,
-                                  "slotDetectors": slotDetectors}
+                                  "slotDetectors": slotDetectors, "clockwise": clockwise,
+                                  "order": motion.displayOrder(angles, clockwise)}
             self._showRawProjections()
         except Exception as e:
             self.projView.setText("Could not read projections")
@@ -2560,64 +2574,47 @@ class SpectReconDialog:
         if self.projMax <= 0:
             self.projMax = 1.0
         stack = motion.slotStack(frames, raw["slots"], raw["ewv"], peakWindow)
-        self.sinoStack = stack[np.argsort(raw["angles"], kind="stable")]
-        self.sinoMax = float(self.sinoStack.max()) if self.sinoStack.size else 1.0
-        rowSums = self.sinoStack.sum(axis=(0, 2))
-        self.projModeIndex.setdefault("Sinogram", int(np.argmax(rowSums)) if rowSums.size else 0)
-        self._applyProjMode()
-
-    def _projMode(self):
-        return self.projModeCombo.currentText
-
-    def _applyProjMode(self):
-        """Slider range, cine and view for the chosen display: frames, sinogram rows or the linogram."""
-        if self.projArray is None:
-            return
-        mode = self._projMode()
-        if mode == "Projections":
-            count = self.projArray.shape[0]
-        elif mode == "Sinogram":
-            count = self.sinoStack.shape[1]
-        else:
-            count = 1
-        self.projSlider.blockSignals(True)
-        self.projSlider.setRange(0, max(0, count - 1))
-        index = min(self.projModeIndex.get(mode, 0), count - 1)
+        self.sinoStack = stack[raw["order"]]
+        self.projSlider.setRange(0, self.projArray.shape[0] - 1)
+        self.projSlider.setEnabled(True)
+        index = min(self.projSlider.value, self.projArray.shape[0] - 1)
         self.projSlider.setValue(index)
-        self.projSlider.blockSignals(False)
-        self.projSlider.setEnabled(count > 1)
-        self.fpsSpin.setEnabled(mode == "Projections")
-        self.cineCheckBox.setEnabled(mode == "Projections")
-        if mode == "Projections" and self.cineCheckBox.checked and not self.busy:
-            self.startProjCine()
-        else:
-            self.stopProjCine()
         self.updateProjView(index)
+        if self.cineCheckBox.checked and not self.busy:
+            self.startProjCine()
+        rows = self.sinoStack.shape[1]
+        first = not self.sinoSlider.isEnabled()
+        self.sinoSlider.setRange(0, rows - 1)
+        self.sinoSlider.setEnabled(True)
+        if first:
+            rowSums = self.sinoStack.sum(axis=(0, 2))
+            self.sinoSlider.setValue(int(np.argmax(rowSums)) if rowSums.size else 0)
+        self.updateSinoViews(self.sinoSlider.value)
+
+    def _sinoImage(self, image):
+        """PET-coloured sinogram / linogram stretched to the square panel (aspect not kept)."""
+        lower, upper = self.windows["sino"]
+        fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
+        vmax = float(image.max()) or 1.0
+        return self.renderer.toPixmap(display.colorize(fitted, vmax, self._petColors(), upper, lower))
+
+    def updateSinoViews(self, row):
+        if self.sinoStack is None or not self.sinoStack.size:
+            return
+        row = min(max(0, row), self.sinoStack.shape[1] - 1)
+        nAngles = self.sinoStack.shape[0]
+        summed = ", gates summed" if self.projGates is not None else ""
+        corrected = ", motion corrected" if self.motion is not None else ""
+        self.sinoView.setPixmap(self._sinoImage(self.sinoStack[:, row, :]))
+        self.sinoInfo.setText(f"Row {row + 1} / {self.sinoStack.shape[1]}   |   {nAngles} angles, "
+                              f"first at the top{summed}{corrected}")
+        self.linoView.setPixmap(self._sinoImage(self.sinoStack.sum(axis=2).T))
+        self.linoInfo.setText(f"{nAngles} angles left to right, axial row 1 at the top{summed}{corrected}")
 
     def updateProjView(self, index):
         if self.projArray is None:
             return
-        mode = self._projMode()
         lower, upper = self.windows["proj"]
-        if mode != "Projections":
-            self.projModeIndex[mode] = index
-            if mode == "Sinogram":
-                image = self.sinoStack[:, index, :]
-                vmax = float(image.max()) or 1.0
-                text = (f"Sinogram, row {index + 1} / {self.sinoStack.shape[1]}   |   "
-                        f"{self.sinoStack.shape[0]} angles, top to bottom")
-            else:
-                image = self.sinoStack.sum(axis=2)
-                vmax = float(image.max()) or 1.0
-                text = (f"Linogram: axial profile (left = row 1) of {self.sinoStack.shape[0]} angles, "
-                        "top to bottom")
-            fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
-            self.projView.setPixmap(self.renderer.toPixmap(display.grayscale(fitted, vmax, upper, lower)))
-            if self.projGates is not None:
-                text += ", gates summed"
-            self.projInfo.setText(text)
-            return
-        self.projModeIndex[mode] = index
         self.projView.setPixmap(self.renderer.toPixmap(
             display.grayscale(self._fit(self.projArray[index]), self.projMax, upper, lower)))
         text = f"Projection {index + 1} / {self.projArray.shape[0]}"
