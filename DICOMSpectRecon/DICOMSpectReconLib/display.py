@@ -173,6 +173,21 @@ def resampleCubic(arr, size, minimum=None, maximum=None):
     return out.astype(np.float32)
 
 
+LINE_COLOUR = (255, 230, 0)
+
+
+def drawLine(rgb, row, rows, colour=LINE_COLOUR):
+    """Horizontal reference line over row (of rows) of a fitted RGB image, in place, with a small
+    handle in the middle to grab it by."""
+    height, width = rgb.shape[0], rgb.shape[1]
+    y = int(min(height - 1, max(0, round((row + 0.5) * height / rows - 0.5))))
+    rgb[y, :] = colour
+    half = max(3, width // 40)
+    centre = width // 2
+    rgb[max(0, y - 3):y + 4, max(0, centre - half):centre + half + 1] = colour
+    return rgb
+
+
 # ---------------------------------------------------------------------------
 # RGB array -> QPixmap
 # ---------------------------------------------------------------------------
