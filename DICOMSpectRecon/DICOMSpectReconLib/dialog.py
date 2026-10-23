@@ -733,8 +733,8 @@ class SpectReconDialog:
         self.restoreDefaultsButton = qt.QPushButton("Restore defaults")
         self.restoreDefaultsButton.setToolTip("Put back the saved defaults")
         self.factoryDefaultsButton = qt.QPushButton("Factory")
-        self.factoryDefaultsButton.setToolTip("Put back the built-in value of every saved setting, after asking "
-                                              "(the saved defaults are kept until you save again)")
+        self.factoryDefaultsButton.setToolTip("Put back the built-in value of every saved setting and forget the "
+                                              "saved defaults, after asking")
         for button, handler in ((self.saveDefaultsButton, self.onSaveDefaults),
                                 (self.restoreDefaultsButton, self.onRestoreDefaults),
                                 (self.factoryDefaultsButton, self.onFactoryDefaults)):
@@ -852,13 +852,15 @@ class SpectReconDialog:
             self.dialog, "Factory settings",
             "Put back the built-in settings for everything that Save defaults keeps?\n\n"
             "This resets all algorithms (OSEM, BSREM and FBP), the static and gated post-filters, output "
-            "scaling, attenuation and scatter correction and the gated settings - not only the ones shown.\n"
-            "Your saved defaults are kept until you press Save defaults again.",
+            "scaling, attenuation and scatter correction, resolution recovery and the gated settings - not "
+            "only the ones shown.\n"
+            "Your saved defaults are deleted too, so the window opens with the built-in settings from now on.",
             qt.QMessageBox.Yes | qt.QMessageBox.No, qt.QMessageBox.No)
         if answer != qt.QMessageBox.Yes:
             return
         self._applyDefaults(self.factoryDefaults)
-        self.log("Built-in settings restored (saved defaults unchanged).")
+        qt.QSettings().remove(DEFAULTS_SETTINGS_KEY)
+        self.log("Built-in settings restored; saved defaults deleted (the window opens with these from now on).")
 
     def _buildQuantificationUI(self, side):
         acq = self.acquisition
