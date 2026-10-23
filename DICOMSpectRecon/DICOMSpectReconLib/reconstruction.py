@@ -212,7 +212,7 @@ def changCorrection(attenuatedMatrix, geometricMatrix, maximum=20.0):
 
 
 class SpectReconLogic:
-    def __init__(self, inputDcm, log=print, ctFiles=None, indexPeak=0,
+    def __init__(self, inputDcm, log=print, ctFiles=None, indexPeak=0, motion=None,
                  progress=None, shouldAbort=None):
         import torch
 
@@ -234,6 +234,19 @@ class SpectReconLogic:
             inputDcm = prepareProjectionFile(inputDcm, self.tempDir, self.log)
         except Exception as e:
             self.log(f"(Could not check the detector radii: {e})")
+        # motion: (dx, dz) pixel shifts per projection slot, applied to every energy window and gate
+        self.motionKey = None
+        if motion is not None:
+            from . import motion as motionCorrection
+            dx, dz = motion
+            corrected = os.path.join(self.tempDir, "motion_corrected.dcm")
+            try:
+                inputDcm = motionCorrection.writeCorrectedFile(inputDcm, corrected, dx, dz)
+            except Exception:
+                self.cleanup()
+                raise
+            self.motionKey = (tuple(np.round(dx, 3)), tuple(np.round(dz, 3)))
+            self.log(f"Motion correction: {motionCorrection.describe(dx, dz)}")
         self.inputDcm = inputDcm
         nmInfo = readNmInfo(inputDcm)
         self.gateNumbers = nmInfo["gateNumbers"]

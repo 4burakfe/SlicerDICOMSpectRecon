@@ -9,6 +9,8 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/reconstruction.py
   ${MODULE_NAME}Lib/quantification.py
   ${MODULE_NAME}Lib/collimators.py
+  ${MODULE_NAME}Lib/motion.py
+  ${MODULE_NAME}Lib/motiondialog.py
   ${MODULE_NAME}Lib/display.py
   ${MODULE_NAME}Lib/dialog.py
   )
