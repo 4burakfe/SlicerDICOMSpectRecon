@@ -21,6 +21,7 @@ from . import display
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
+DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
 
 
@@ -460,10 +461,10 @@ class SpectReconDialog:
         self.subsetsSpin.setToolTip("Best if it divides the number of projection angles (e.g. 6 or 10 for 60 views)")
         self.bsremItersSpin = qt.QSpinBox()
         self.bsremItersSpin.setRange(1, 200)
-        self.bsremItersSpin.setValue(20)
-        self.bsremItersSpin.setToolTip("BSREM converges, so more iterations stop changing the image; "
-                                       "15-30 is usual")
-        self.bsremBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.3, "",
+        self.bsremItersSpin.setValue(4)
+        self.bsremItersSpin.setToolTip("BSREM converges (started from one OSEM iteration), so more iterations "
+                                       "change the image little; 4 is usually enough")
+        self.bsremBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.6, "",
                                      "Prior strength beta: higher is smoother (less noise, slightly less "
                                      "contrast in small hot spots). 0 is unregularised (converges towards MLEM).")
         self.bsremGammaSpin = _slider(0.0, 10.0, 0.1, 1, 2.0, "",
@@ -540,6 +541,11 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
             self.gatedSubsetsSpin.setToolTip("OSEM only; with BSREM or FBP the gates use the static settings")
+            self.gatedBetaSpin = _slider(0.0, 5.0, 0.01, 2, 1.0, "",
+                                         "BSREM prior strength for the gates (BSREM has no post-filter). Gates hold "
+                                         "few counts, so a higher beta than the static image is usual; iterations, "
+                                         "subsets and gamma are the static ones.")
+            self.gatedBetaLabel = qt.QLabel("Beta:")
             self.gatedFilterCombo = qt.QComboBox()
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
@@ -559,6 +565,8 @@ class SpectReconDialog:
             for row, (label, widget) in enumerate(left):
                 gatedForm.addWidget(qt.QLabel(label), row + 1, 0)
                 gatedForm.addWidget(widget, row + 1, 1)
+            gatedForm.addWidget(self.gatedBetaLabel, len(left) + 1, 0)
+            gatedForm.addWidget(self.gatedBetaSpin, len(left) + 1, 1)
             for row, (label, widget) in enumerate(right):
                 gatedForm.addWidget(qt.QLabel(label), row, 2)
                 gatedForm.addWidget(widget, row, 3)
@@ -695,6 +703,24 @@ class SpectReconDialog:
             buttonRow.addWidget(button)
         actionLayout.addLayout(buttonRow)
 
+        defaultsRow = qt.QHBoxLayout()
+        defaultsRow.setSpacing(4)
+        self.saveDefaultsButton = qt.QPushButton("Save defaults")
+        self.saveDefaultsButton.setToolTip("Remember the current reconstruction, filter, correction and scaling "
+                                           "settings; they are used every time this window opens")
+        self.restoreDefaultsButton = qt.QPushButton("Restore defaults")
+        self.restoreDefaultsButton.setToolTip("Put back the saved defaults")
+        self.factoryDefaultsButton = qt.QPushButton("Factory")
+        self.factoryDefaultsButton.setToolTip("Put back the built-in settings (the saved defaults are kept "
+                                              "until you save again)")
+        for button, handler in ((self.saveDefaultsButton, self.onSaveDefaults),
+                                (self.restoreDefaultsButton, self.onRestoreDefaults),
+                                (self.factoryDefaultsButton, self.onFactoryDefaults)):
+            button.setAutoDefault(False)
+            button.connect("clicked()", handler)
+            defaultsRow.addWidget(button)
+        actionLayout.addLayout(defaultsRow)
+
         self.applyButton.connect("clicked()", self.onApply)
         self.loadButton.connect("clicked()", self.onLoad)
         self.cancelButton.connect("clicked()", self.onCancelClicked)
@@ -704,8 +730,101 @@ class SpectReconDialog:
 
         self._watchSettings()
         self._updateCtState()
+        self.factoryDefaults = self._defaultsValues()
+        saved = self._savedDefaults()
+        if saved:
+            self._applyDefaults(saved)
         self._updateLoadState()
         self._resizeDialog()
+
+    # ---------------- saved defaults ----------------
+    def _defaultsWidgets(self):
+        """Side panel settings that can be saved as defaults, by key. Study specific choices (CT series,
+        energy windows, quantification) are left out. The algorithm comes first: switching it changes
+        the post-filters, which are set after it."""
+        widgets = [("algorithm", self.algorithmCombo), ("iters", self.itersSpin), ("subsets", self.subsetsSpin),
+                   ("bsremIters", self.bsremItersSpin), ("bsremBeta", self.bsremBetaSpin),
+                   ("bsremGamma", self.bsremGammaSpin), ("fbpWindow", self.fbpWindowCombo),
+                   ("fbpCutoff", self.fbpCutoffSpin), ("fbpOrder", self.fbpOrderSpin),
+                   ("filter", self.filterCombo), ("fwhm", self.fwhmSpin), ("cutoff", self.cutoffSpin),
+                   ("order", self.orderSpin), ("scaling", self.scalingCombo),
+                   ("attenuationCorrection", self.acCheckBox), ("showOnCt", self.showOnCtCheckBox),
+                   ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin)]
+        if self.isGated:
+            widgets += [("gated", self.gatedEnableCheckBox), ("gatedIters", self.gatedItersSpin),
+                        ("gatedSubsets", self.gatedSubsetsSpin), ("gatedBeta", self.gatedBetaSpin),
+                        ("gatedFilter", self.gatedFilterCombo), ("gatedFwhm", self.gatedFwhmSpin),
+                        ("gatedCutoff", self.gatedCutoffSpin), ("gatedOrder", self.gatedOrderSpin)]
+        return widgets
+
+    def _defaultsValues(self):
+        values = {}
+        for key, widget in self._defaultsWidgets():
+            if isinstance(widget, qt.QComboBox):
+                values[key] = widget.currentText
+            elif isinstance(widget, qt.QCheckBox):
+                values[key] = bool(widget.checked)
+            else:
+                values[key] = float(widget.value)
+        return values
+
+    def _applyDefaults(self, values):
+        """Set the widgets from saved values; unknown keys and values that no longer fit are skipped.
+        Attenuation and scatter stay as they are while a calibration locks them."""
+        locked = getattr(self, "quantLocked", False)
+        for key, widget in self._defaultsWidgets():
+            if key not in values:
+                continue
+            if locked and key in ("attenuationCorrection", "scatter", "scatterWeight"):
+                continue
+            value = values[key]
+            try:
+                if isinstance(widget, qt.QComboBox):
+                    index = widget.findText(str(value))
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+                elif isinstance(widget, qt.QCheckBox):
+                    if key == "attenuationCorrection":
+                        if not self.ctFiles:
+                            continue  # nothing to correct with; AC switches on by itself once a CT is picked
+                        self.acUserSet = True
+                    if key == "scatter" and not self._scatterAvailable():
+                        continue
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, qt.QSpinBox):
+                    widget.setValue(int(round(float(value))))
+                else:
+                    widget.setValue(float(value))
+            except (TypeError, ValueError):
+                continue
+        self._updateScatterState()
+        self._updateLockedWidgets()
+        self._updateLoadState()
+
+    @staticmethod
+    def _savedDefaults():
+        try:
+            text = qt.QSettings().value(DEFAULTS_SETTINGS_KEY) or ""
+            values = json.loads(text) if text else None
+            return values if isinstance(values, dict) else None
+        except (TypeError, ValueError):
+            return None
+
+    def onSaveDefaults(self):
+        qt.QSettings().setValue(DEFAULTS_SETTINGS_KEY, json.dumps(self._defaultsValues()))
+        self.log("Current settings saved as defaults (used every time this window opens).")
+
+    def onRestoreDefaults(self):
+        saved = self._savedDefaults()
+        if not saved:
+            self.log("No saved defaults yet - press Save defaults first. (Factory puts back the built-in settings.)")
+            return
+        self._applyDefaults(saved)
+        self.log("Saved defaults restored.")
+
+    def onFactoryDefaults(self):
+        self._applyDefaults(self.factoryDefaults)
+        self.log("Built-in settings restored (saved defaults unchanged).")
 
     def _buildQuantificationUI(self, side):
         acq = self.acquisition
@@ -1395,6 +1514,8 @@ class SpectReconDialog:
         if self.isGated:
             self.gatedItersSpin.setEnabled(algorithm == ALGORITHM_OSEM)
             self.gatedSubsetsSpin.setEnabled(algorithm == ALGORITHM_OSEM)
+            for widget in (self.gatedBetaLabel, self.gatedBetaSpin):
+                widget.setVisible(algorithm == ALGORITHM_BSREM)
 
     def _showNyquistFraction(self, slider, label):
         """What a cutoff in cycles/cm is on this study's pixels."""
@@ -1446,6 +1567,7 @@ class SpectReconDialog:
                 "gated": bool(self.gatedEnableCheckBox.checked),
                 "gatedIters": self.gatedItersSpin.value,
                 "gatedSubsets": self.gatedSubsetsSpin.value,
+                "gatedBeta": round(self.gatedBetaSpin.value, 4),
                 "gatedFilter": self.gatedFilterCombo.currentText,
                 "gatedFwhm": self.gatedFwhmSpin.value,
                 "gatedCutoff": self.gatedCutoffSpin.value,
@@ -1485,6 +1607,14 @@ class SpectReconDialog:
             return params["bsrem"]["iters"], params["subsets"]
         return None, None
 
+    @staticmethod
+    def bsremParams(params, gated=False):
+        """BSREM settings of the static image, or of the gates (their own beta)."""
+        bsrem = dict(params["bsrem"])
+        if gated and params.get("gatedBeta") is not None:
+            bsrem["beta"] = params["gatedBeta"]
+        return bsrem
+
     @classmethod
     def reconKeyFor(cls, params, gated=False):
         """Everything that changes the reconstruction result (not post-filtering or count scaling).
@@ -1497,7 +1627,8 @@ class SpectReconDialog:
         else:
             settings = cls.reconIterations(params, gated)
             if params["algorithm"] == ALGORITHM_BSREM:
-                settings += (params["bsrem"]["beta"], params["bsrem"]["gamma"])
+                bsrem = cls.bsremParams(params, gated)
+                settings += (bsrem["beta"], bsrem["gamma"])
         ctId = params["ctId"] if params["attenuationCorrection"] else None
         return (params["algorithm"], settings, params["attenuationCorrection"], ctId, params["indexPeak"],
                 params["indexLower"], params["indexUpper"], params.get("scatterWeight"), prefix)
@@ -1518,7 +1649,8 @@ class SpectReconDialog:
         self.cancelButton.setText("Stop" if busy else "Cancel")
         self.cancelButton.setEnabled(True)
         # The CT and photopeak must not change underneath a running reconstruction
-        for widget in (self.ctCombo, self.ctBrowseButton, self.peakCombo):
+        for widget in (self.ctCombo, self.ctBrowseButton, self.peakCombo, self.saveDefaultsButton,
+                       self.restoreDefaultsButton, self.factoryDefaultsButton):
             widget.setEnabled(not busy)
         for widget in (self.quantGroup, self.suvGroup):
             widget.setEnabled(not busy and (widget is not self.suvGroup or self.quantGroup.checked))
@@ -1775,7 +1907,7 @@ class SpectReconDialog:
                 iters, subsets = self.reconIterations(params, gated=True)
                 image, gateStats = self.logic.reconstruct(
                     iters, subsets, params["attenuationCorrection"], scatter, projectionSet=projectionSet,
-                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=params["bsrem"])
+                    algorithm=params["algorithm"], fbp=params["fbp"], bsrem=self.bsremParams(params, gated=True))
                 images.append(image)
                 stats.append(gateStats)
             self.gateRawImages, self.gateRawStats = images, stats
@@ -1798,6 +1930,8 @@ class SpectReconDialog:
         self.info["GatedIterations"] = gatedIters or "n/a"
         self.info["GatedSubsets"] = gatedSubsets or "n/a"
         self.info["GatedPostFilter"] = filterDescription(gatedFilter)
+        if params["algorithm"] == ALGORITHM_BSREM:
+            self.info["GatedPrior"] = bsremDescription(self.bsremParams(params, gated=True))
         if params.get("quant"):
             # A gate's counting time is not the acquisition duration, so gates are not converted
             self.info["GatedUnits"] = "acquisition counts (not quantified)"
@@ -1818,6 +1952,8 @@ class SpectReconDialog:
             "Iterations": gatedIters or "n/a",
             "Subsets": gatedSubsets or "n/a",
             "PostFilter": filterDescription(gatedFilter),
+            **({"Prior": bsremDescription(self.bsremParams(params, gated=True))}
+               if params["algorithm"] == ALGORITHM_BSREM else {}),
             "CountScaling": params["scaling"],
             "CountScalingFactor": f"{factor:.6g}",
             "Views": stats["nViews"],
@@ -1867,7 +2003,8 @@ class SpectReconDialog:
                    self.weightSpin, self.heightSpin, self.sexCombo]
         if self.isGated:
             watched += [self.gatedEnableCheckBox, self.gatedItersSpin, self.gatedSubsetsSpin,
-                        self.gatedFilterCombo, self.gatedFwhmSpin, self.gatedCutoffSpin, self.gatedOrderSpin]
+                        self.gatedFilterCombo, self.gatedFwhmSpin, self.gatedCutoffSpin, self.gatedOrderSpin,
+                        self.gatedBetaSpin]
         for widget in watched:
             if isinstance(widget, qt.QDateTimeEdit):
                 signal = "dateTimeChanged(QDateTime)"
