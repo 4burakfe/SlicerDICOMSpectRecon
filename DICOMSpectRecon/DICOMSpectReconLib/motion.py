@@ -16,6 +16,12 @@ Detection (photopeak window, gates summed):
   are moved back onto the sinusoid of the longest segment.
 Shifts below a threshold are set to zero.
 
+Written for this extension, on the ideas of: R.L. Eisner et al., Use of cross-correlation function to
+detect patient motion during SPECT imaging, J Nucl Med 1987;28:97-101 (axial); W.J. Geckle et al.,
+Correction for patient and organ movement in SPECT, J Nucl Med 1988;29:441-450 (tracking the centre
+of the activity over the projections and shifting them); see J.A. Cooper et al., J Nucl Med
+1993;34:1341-1348 for a comparison of detection methods.
+
 No Slicer dependency; pydicom is imported when files are read or written.
 """
 

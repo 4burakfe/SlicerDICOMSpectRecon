@@ -36,7 +36,9 @@ Author: Burak Demir, MD, FEBNM
   the system matrix (Gaussian PSF, sigma(d) = sqrt((d_hole / L_eff x d + d_hole)^2 + intrinsic^2), with
   L_eff = L - 2 / mu_lead at the photopeak energy), as in vendor resolution recovery. The collimator is
   matched from the DICOM header (manufacturer, camera model, collimator name; e.g. a GE NM/CT 850/860/870
-  "LEHRS" gets G8-LHRS: 1.43 mm holes, 0.13 mm septa, 32 mm long) or picked by hand. It raises contrast
+  "LEHRS" gets G8-LHRS: 1.43 mm holes, 0.13 mm septa, 32 mm long) or picked by hand. The collimator
+  dimensions come from the collimator data base of the SIMIND Monte Carlo program [1], as shipped with
+  PyTomography. It raises contrast
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
   While it is on, the iterations are multiplied by an "RR iterations" factor (x2 for OSEM, static and
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
@@ -44,16 +46,19 @@ Author: Burak Demir, MD, FEBNM
   reconstruction of the axial slice at the yellow line (2D, with the main window's algorithm,
   iterations, subsets, prior or FBP window and post-filter, without attenuation, scatter or resolution
   recovery; computed in the background after 1 s without changes), the projections (in cine), the
-  summed sinogram and the linogram on the top row and the motion
-  corrected ones below,
-  with a plot of the shift of every view. *Detect* finds axial
-  (up/down) movement by matching every view's axial count profile to the median profile, and sideways
-  movement from the transaxial centre of mass, which follows a sinusoid over the angles until the
-  patient moves (the acquisition is split in time where it jumps to another sinusoid, and the views are
-  moved back onto the longest one). Shifts can also be added by hand to a single time step (the
-  default) or a range of steps, on all detectors or one, and are applied live; changing a step stops
-  the cine and shows that view. The mouse wheel steps through
-  the projections, or moves the line over the other views. The shifts are applied to every energy window and gate before reconstruction.
+  summed sinogram and the linogram on the top row and the motion corrected ones below, with a plot of
+  the shift of every view. *Detect* finds axial (up/down) movement by cross-correlating every view's
+  axial count profile with the median profile [2], and sideways movement from the transaxial centre of
+  mass of the views [3], which follows a sinusoid over the angles until the patient moves (the
+  acquisition is split in time where it jumps to another sinusoid, and the views are moved back onto
+  the longest one); the views are shifted before reconstruction, as in [3]. See [4] for a comparison of
+  such detection methods. The detection and correction were written for this extension; they are not
+  a copy of a published or vendor implementation. Shifts can also be added by hand to a single time
+  step (the default) or a range of steps, on all detectors or one, and are applied live; changing a
+  step stops the cine and shows that view. The mouse wheel steps through the projections, or moves the
+  line over the other views. The shifts are applied to every energy window and gate before
+  reconstruction; gated studies are detected on the summed gates, so only patient motion (not the
+  heart's own motion between gates) is corrected.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
 - **Scatter correction** with dual or triple energy windows, chosen from the acquisition's windows.
@@ -104,7 +109,7 @@ a middle double-click resets it.
 
 *Nuclear Medicine > SPECT Collimators* edits the collimator library used for resolution recovery (a JSON
 file next to Slicer's settings). It starts with the parallel-hole collimators that PyTomography ships
-(from the SIMIND data base) and shows each one's system resolution at 10 cm / 140 keV to compare with the
+(from the SIMIND data base [1]) and shows each one's system resolution at 10 cm / 140 keV to compare with the
 datasheet. Add, Duplicate, Delete and edit the cells, then **Save**; **Restore defaults** puts back the
 built-in list. *Test header matching* shows which collimator a header (manufacturer, model, collimator
 name) gets. Reconstruction windows read the library when they open.
@@ -142,3 +147,19 @@ Additional module paths* and restart Slicer.
 
 Reconstruction powered by [PyTomography](https://github.com/qurit/PyTomography) (see the citation at the
 top of this page).
+
+## References
+
+1. M. Ljungberg, S.-E. Strand. A Monte Carlo program for the simulation of scintillation camera
+   characteristics. *Computer Methods and Programs in Biomedicine* 1989;29(4):257-272.
+   [SIMIND](https://www.msf.lu.se/en/research/simind-monte-carlo-program) (source of the collimator
+   data base).
+2. R.L. Eisner, T. Noever, D. Nowak, W. Carlson, D. Dunn, J. Oates, K. Cloninger, H.A. Liberman,
+   R.E. Patterson. Use of cross-correlation function to detect patient motion during SPECT imaging.
+   *J Nucl Med* 1987;28(1):97-101. [jnm.snmjournals.org/content/28/1/97](https://jnm.snmjournals.org/content/28/1/97)
+3. W.J. Geckle, T.L. Frank, J.M. Links, L.C. Becker. Correction for patient and organ movement in SPECT:
+   application to exercise thallium-201 cardiac imaging. *J Nucl Med* 1988;29(4):441-450.
+   [jnm.snmjournals.org/content/29/4/441](https://jnm.snmjournals.org/content/29/4/441)
+4. J.A. Cooper, P.H. Neumann, B.K. McCandless. Detection of patient motion during tomographic myocardial
+   perfusion imaging. *J Nucl Med* 1993;34(8):1341-1348.
+   [jnm.snmjournals.org/content/34/8/1341](https://jnm.snmjournals.org/content/34/8/1341)
