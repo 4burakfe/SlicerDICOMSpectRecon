@@ -444,9 +444,9 @@ class SpectReconDialog:
                                         qt.Qt.ToolTipRole)
         self.algorithmCombo.setItemData(1, "Block sequential regularised EM: OSEM-like updates with a relative "
                                            "difference prior and a decreasing step, so it converges. The prior "
-                                           "strength (beta) sets the noise, not the iteration count, and no "
-                                           "post-filter is needed (it is switched off when BSREM is chosen). "
-                                           "Starts from one OSEM iteration, like Q.Clear.", qt.Qt.ToolTipRole)
+                                           "strength (beta) sets the noise, not the iteration count; the "
+                                           "post-filter can be added on top. Starts from one OSEM iteration, "
+                                           "like Q.Clear.", qt.Qt.ToolTipRole)
         self.algorithmCombo.setItemData(2, "Filtered backprojection (analytic): ramp filter with a window, "
                                            "scatter subtracted from the projections, Chang attenuation "
                                            "correction. The window does the smoothing, so the post-filter "
@@ -464,7 +464,7 @@ class SpectReconDialog:
         self.bsremItersSpin.setValue(4)
         self.bsremItersSpin.setToolTip("BSREM converges (started from one OSEM iteration), so more iterations "
                                        "change the image little; 4 is usually enough")
-        self.bsremBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.6, "",
+        self.bsremBetaSpin = _slider(0.0, 5.0, 0.01, 2, 2.0, "",
                                      "Prior strength beta: higher is smoother (less noise, slightly less "
                                      "contrast in small hot spots). 0 is unregularised (converges towards MLEM).")
         self.bsremGammaSpin = _slider(0.0, 10.0, 0.1, 1, 2.0, "",
@@ -541,11 +541,14 @@ class SpectReconDialog:
             self.gatedSubsetsSpin.setRange(1, 128)
             self.gatedSubsetsSpin.setValue(10)
             self.gatedSubsetsSpin.setToolTip("OSEM only; with BSREM or FBP the gates use the static settings")
-            self.gatedBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.75, "",
-                                         "BSREM prior strength for the gates (BSREM has no post-filter). Gates hold "
-                                         "few counts, so a higher beta than the static image is usual; iterations, "
-                                         "subsets and gamma are the static ones.")
+            self.gatedBetaSpin = _slider(0.0, 5.0, 0.01, 2, 0.4, "",
+                                         "BSREM prior strength for the gates (on top of the gated post-filter); "
+                                         "iterations and subsets are the static ones.")
             self.gatedBetaLabel = qt.QLabel("Beta:")
+            self.gatedGammaSpin = _slider(0.0, 10.0, 0.1, 1, 2.0, "",
+                                          "Relative difference prior gamma for the gates: higher keeps edges "
+                                          "sharper (penalises large differences less).")
+            self.gatedGammaLabel = qt.QLabel("Gamma:")
             self.gatedFilterCombo = qt.QComboBox()
             self.gatedFilterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
             self.gatedFilterCombo.setCurrentIndex(2)
@@ -567,6 +570,8 @@ class SpectReconDialog:
                 gatedForm.addWidget(widget, row + 1, 1)
             gatedForm.addWidget(self.gatedBetaLabel, len(left) + 1, 0)
             gatedForm.addWidget(self.gatedBetaSpin, len(left) + 1, 1)
+            gatedForm.addWidget(self.gatedGammaLabel, len(left) + 2, 0)
+            gatedForm.addWidget(self.gatedGammaSpin, len(left) + 2, 1)
             for row, (label, widget) in enumerate(right):
                 gatedForm.addWidget(qt.QLabel(label), row, 2)
                 gatedForm.addWidget(widget, row, 3)
@@ -753,6 +758,7 @@ class SpectReconDialog:
         if self.isGated:
             widgets += [("gated", self.gatedEnableCheckBox), ("gatedIters", self.gatedItersSpin),
                         ("gatedSubsets", self.gatedSubsetsSpin), ("gatedBeta", self.gatedBetaSpin),
+                        ("gatedGamma", self.gatedGammaSpin),
                         ("gatedFilter", self.gatedFilterCombo), ("gatedFwhm", self.gatedFwhmSpin),
                         ("gatedCutoff", self.gatedCutoffSpin), ("gatedOrder", self.gatedOrderSpin)]
         return widgets
@@ -1488,9 +1494,9 @@ class SpectReconDialog:
         self.gatedCutoffNyquistLabel.setEnabled(name in ("Butterworth", "Hann"))
 
     def onAlgorithmChanged(self, index):
-        """FBP smooths with its own window and BSREM with its prior, so the post-filters are switched
-        off for them (and put back when going back to OSEM)."""
-        fbp = self.algorithmCombo.currentText != ALGORITHM_OSEM
+        """FBP smooths with its own window, so the post-filters are switched off for it (and put back
+        when leaving FBP). OSEM and BSREM keep them."""
+        fbp = self.algorithmCombo.currentText == ALGORITHM_FBP
         combos = [self.filterCombo] + ([self.gatedFilterCombo] if self.isGated else [])
         if fbp and self.postFilterBeforeFbp is None:
             self.postFilterBeforeFbp = [combo.currentIndex for combo in combos]
@@ -1514,7 +1520,7 @@ class SpectReconDialog:
         if self.isGated:
             self.gatedItersSpin.setEnabled(algorithm == ALGORITHM_OSEM)
             self.gatedSubsetsSpin.setEnabled(algorithm == ALGORITHM_OSEM)
-            for widget in (self.gatedBetaLabel, self.gatedBetaSpin):
+            for widget in (self.gatedBetaLabel, self.gatedBetaSpin, self.gatedGammaLabel, self.gatedGammaSpin):
                 widget.setVisible(algorithm == ALGORITHM_BSREM)
 
     def _showNyquistFraction(self, slider, label):
@@ -1568,6 +1574,7 @@ class SpectReconDialog:
                 "gatedIters": self.gatedItersSpin.value,
                 "gatedSubsets": self.gatedSubsetsSpin.value,
                 "gatedBeta": round(self.gatedBetaSpin.value, 4),
+                "gatedGamma": round(self.gatedGammaSpin.value, 4),
                 "gatedFilter": self.gatedFilterCombo.currentText,
                 "gatedFwhm": self.gatedFwhmSpin.value,
                 "gatedCutoff": self.gatedCutoffSpin.value,
@@ -1609,10 +1616,12 @@ class SpectReconDialog:
 
     @staticmethod
     def bsremParams(params, gated=False):
-        """BSREM settings of the static image, or of the gates (their own beta)."""
+        """BSREM settings of the static image, or of the gates (their own beta and gamma)."""
         bsrem = dict(params["bsrem"])
         if gated and params.get("gatedBeta") is not None:
             bsrem["beta"] = params["gatedBeta"]
+        if gated and params.get("gatedGamma") is not None:
+            bsrem["gamma"] = params["gatedGamma"]
         return bsrem
 
     @classmethod
@@ -2004,7 +2013,7 @@ class SpectReconDialog:
         if self.isGated:
             watched += [self.gatedEnableCheckBox, self.gatedItersSpin, self.gatedSubsetsSpin,
                         self.gatedFilterCombo, self.gatedFwhmSpin, self.gatedCutoffSpin, self.gatedOrderSpin,
-                        self.gatedBetaSpin]
+                        self.gatedBetaSpin, self.gatedGammaSpin]
         for widget in watched:
             if isinstance(widget, qt.QDateTimeEdit):
                 signal = "dateTimeChanged(QDateTime)"
