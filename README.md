@@ -40,8 +40,10 @@ Author: Burak Demir, MD, FEBNM
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
   While it is on, the iterations are multiplied by an "RR iterations" factor (x2 for OSEM, static and
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
-- **Motion correction** (orange *Motion correction...* button): a separate window shows the original
-  projections (in cine), sinogram and linogram on the top row and the motion corrected ones below,
+- **Motion correction** (orange *Motion correction...* button): a separate window shows a fast
+  reconstruction of the axial slice at the yellow line (1 pixel thick 2D OSEM, redone 1 s after each
+  change), the projections (in cine), the summed sinogram and the linogram on the top row and the motion
+  corrected ones below,
   with a plot of the shift of every view. *Detect* finds axial
   (up/down) movement by matching every view's axial count profile to the median profile, and sideways
   movement from the transaxial centre of mass, which follows a sinusoid over the angles until the
@@ -75,14 +77,14 @@ Author: Burak Demir, MD, FEBNM
    and the settings (OSEM, BSREM or FBP, attenuation, scatter, filter, scaling, quantification).
 3. Press **Reconstruct**, check the preview, then **Load into Slicer**.
 
-Next to the raw projections the window shows a **sinogram** (one projection row for every view, in the
-order of the rotation, first view at the top; a sideways patient movement shows as a jump in the sine
-curves) and a **linogram** (the axial count profile of every view, views left to right; an up/down
-movement shows as a step), in PET-DICOM colours and stretched to the square panel, with the gates of a
-gated study summed. They sit in a row below the previews, or in a column on the right when a CT is shown. A yellow
-line over the rotating projections (drag it with the left mouse button) picks the sinogram row, and every
-display window (projections, sinogram, linogram and the reconstruction slice at that height) is scaled to
-the maximum on that line; the motion correction window has the same line. On every preview,
+Next to the raw projections the window shows a **summed sinogram** (all projection rows summed along the
+axis for every view, in the order of the rotation, first view at the top; a sideways patient movement
+shows as a jump in the sine curves) and a **linogram** (the axial count profile of every view, views left
+to right; an up/down movement shows as a step), in PET-DICOM colours and stretched to the square panel,
+with the gates of a gated study summed. They sit in a row below the previews, or in a column on the right
+when a CT is shown. A yellow line over the rotating projections (drag it with the left mouse button)
+follows the axial slice, and the slice follows it; the projection, linogram and reconstruction windows
+are scaled to the maximum on that line. On every preview,
 drag with the **middle mouse button** to change the display window (left/right: width, up/down: level);
 a middle double-click resets it.
 

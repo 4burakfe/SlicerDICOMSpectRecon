@@ -1,6 +1,6 @@
-"""Motion correction window: automatic and manual shifts of the projections. The original projections
-(cine), sinogram and linogram are shown on the top row, the motion corrected ones below, with a plot
-of the shifts."""
+"""Motion correction window: automatic and manual shifts of the projections. A fast reconstruction of the
+axial slice at the reference line, the projections (cine), the summed sinogram and the linogram are shown
+on the top row, the motion corrected ones below, with a plot of the shifts."""
 
 import numpy as np
 import qt
@@ -8,9 +8,10 @@ import qt
 from . import display
 from . import motion
 
-VIEW_SIZE = 260
+VIEW_SIZE = 240
 PLOT_HEIGHT = 170
-PLOT_WIDTH = 3 * VIEW_SIZE + 20
+PLOT_WIDTH = 4 * VIEW_SIZE + 30
+RECON_DELAY_MS = 1000         # the slice is reconstructed 1 s after the last change
 CINE_INTERVAL_MS = 120
 DX_COLOUR = (255, 150, 40)    # lateral
 DZ_COLOUR = (60, 200, 255)    # axial
@@ -72,6 +73,8 @@ class MotionCorrectionWindow:
         else:
             self.dx, self.dz = np.zeros(n), np.zeros(n)
         self.corrected = None
+        self.sliceRecon = None        # motion.SliceReconstructor, made on first use
+        self.originalSlice = None     # (row, image) of the uncorrected slice
         self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
         self.plotRenderer = display.PixmapRenderer(PLOT_WIDTH)
@@ -88,7 +91,7 @@ class MotionCorrectionWindow:
         views = qt.QGridLayout()
         layout.addLayout(views, 1)
         self.views = {}
-        for column, title in enumerate(("Projection", "Sinogram", "Linogram")):
+        for column, title in enumerate(("Axial slice (fast)", "Projection", "Summed sinogram", "Linogram")):
             header = qt.QLabel(f"<b>{title}</b>")
             header.setAlignment(qt.Qt.AlignCenter)
             views.addWidget(header, 0, column + 1)
@@ -96,7 +99,7 @@ class MotionCorrectionWindow:
             label = qt.QLabel(f"<b>{title}</b>")
             label.setAlignment(qt.Qt.AlignCenter)
             views.addWidget(label, row + 1, 0)
-            for column, image in enumerate(("projection", "sinogram", "linogram")):
+            for column, image in enumerate(("axial", "projection", "sinogram", "linogram")):
                 view = qt.QLabel()
                 view.setFixedSize(VIEW_SIZE, VIEW_SIZE)
                 view.setAlignment(qt.Qt.AlignCenter)
@@ -117,7 +120,7 @@ class MotionCorrectionWindow:
         sliders.addWidget(self.projSlider, 0, 1)
         self.projLabel = qt.QLabel("")
         sliders.addWidget(self.projLabel, 0, 2)
-        sliders.addWidget(qt.QLabel("Sinogram row:"), 1, 0)
+        sliders.addWidget(qt.QLabel("Line:"), 1, 0)
         self.rowSlider = qt.QSlider(qt.Qt.Horizontal)
         self.rowSlider.setRange(0, self.stack.shape[1] - 1)
         rowSums = self.stack.sum(axis=(0, 2))
@@ -127,27 +130,33 @@ class MotionCorrectionWindow:
         self.rowLabel = qt.QLabel("")
         sliders.addWidget(self.rowLabel, 1, 2)
         sliders.setColumnStretch(1, 1)
-        views.addLayout(sliders, 3, 1, 1, 3)
-        caption = qt.QLabel("Projections and sinogram rows run along the rotation, first view at the top of the "
-                            "sinogram; the linogram (axial profile) has the views left to right and axial row 1 "
-                            "at the top. Photopeak window, gates summed. Drag the yellow line on the projections "
-                            "(left mouse button) to pick the sinogram row; every view is scaled to the "
-                            "maximum on that line.")
+        views.addLayout(sliders, 3, 1, 1, 4)
+        caption = qt.QLabel("Drag the yellow line on the projections (left mouse button) to pick the axial "
+                            "level. The axial slice there (1 pixel thick) is reconstructed 1 s after the last "
+                            "change with a quick 2D OSEM (no attenuation, scatter or resolution recovery), "
+                            "original and corrected on the same scale. The sinogram is all rows summed along "
+                            "the axis, views along the rotation from the top; the linogram has the views left "
+                            "to right and axial row 1 at the top. Photopeak window, gates summed.")
         caption.setWordWrap(True)
         caption.setStyleSheet("color: gray;")
-        views.addWidget(caption, 4, 1, 1, 3)
+        views.addWidget(caption, 4, 1, 1, 4)
         self.plotView = qt.QLabel()
         self.plotView.setFixedSize(PLOT_WIDTH, PLOT_HEIGHT)
-        views.addWidget(self.plotView, 5, 1, 1, 3)
+        views.addWidget(self.plotView, 5, 1, 1, 4)
         legend = qt.QLabel("Shift per view (pixels) in acquisition order: <span style='color:#ff9628'>"
                            "lateral dx</span>, <span style='color:#3cc8ff'>axial dz</span>; grey lines at "
                            "0 and &plusmn;1 pixel, white lines between detectors.")
         legend.setWordWrap(True)
-        views.addWidget(legend, 6, 1, 1, 3)
+        views.addWidget(legend, 6, 1, 1, 4)
 
         self.lineFilters = []
         for kind in ("original", "corrected"):
             self._installLineDrag(self.views[(kind, "projection")])
+
+        self.reconTimer = qt.QTimer()
+        self.reconTimer.setSingleShot(True)
+        self.reconTimer.setInterval(RECON_DELAY_MS)
+        self.reconTimer.connect("timeout()", self._reconstructSlice)
 
         self.cineTimer = qt.QTimer()
         self.cineTimer.setInterval(CINE_INTERVAL_MS)
@@ -290,21 +299,49 @@ class MotionCorrectionWindow:
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
-    def _colour(self, image, vmax):
-        """PET-coloured, stretched to the square view (aspect not kept)."""
-        return self.renderer.toPixmap(display.colorize(_fitTo(image, VIEW_SIZE), vmax or 1.0, self.petColors, 1.0))
+    def _colour(self, image, vmax, lineRow=None, rows=None):
+        """PET-coloured, stretched to the square view (aspect not kept), with the reference line if given."""
+        rgb = display.colorize(_fitTo(image, VIEW_SIZE), vmax or 1.0, self.petColors, 1.0)
+        if lineRow is not None:
+            display.drawLine(rgb, lineRow, rows)
+        return self.renderer.toPixmap(rgb)
 
     def _refreshImages(self):
         row = self.rowSlider.value
         self.rowLabel.setText(f"{row + 1} / {self.stack.shape[1]}")
         original, corrected = self.stack[self.order], self.corrected[self.order]
+        rows = self.stack.shape[1]
         line = original[:, row, :]  # the reference line on every projection sets the display maxima
-        sinoMax = float(line.max())
+        sinoMax = float(original.sum(axis=1).max())
         linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
-            self.views[(kind, "sinogram")].setPixmap(self._colour(data[:, row, :], sinoMax))
-            self.views[(kind, "linogram")].setPixmap(self._colour(data.sum(axis=2).T, linoMax))
+            self.views[(kind, "sinogram")].setPixmap(self._colour(data.sum(axis=1), sinoMax))
+            self.views[(kind, "linogram")].setPixmap(self._colour(data.sum(axis=2).T, linoMax, row, rows))
         self._refreshProjections()
+        self._scheduleRecon()
+
+    # ---------------- fast axial slice ----------------
+    def _scheduleRecon(self):
+        """(Re)start the 1 s wait: dragging the line or changing the shifts restarts it."""
+        self.reconTimer.start()
+
+    def _reconstructSlice(self):
+        row = self.rowSlider.value
+        try:
+            if self.sliceRecon is None:
+                self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2])
+            if self.originalSlice is None or self.originalSlice[0] != row:
+                self.originalSlice = (row, self.sliceRecon.reconstruct(self.stack[:, row, :]))
+            corrected = self.sliceRecon.reconstruct(self.corrected[:, row, :])
+        except Exception as e:
+            self.log(f"Fast slice reconstruction failed: {e}")
+            return
+        original = self.originalSlice[1]
+        vmax = float(original.max()) or float(corrected.max()) or 1.0
+        for kind, image in (("original", original), ("corrected", corrected)):
+            view = self.views[(kind, "axial")]
+            view.setPixmap(self._colour(image, vmax))
+            view.setToolTip(f"Axial slice at line {row + 1}, 1 pixel thick (fast 2D OSEM, no attenuation)")
 
     def _refreshProjections(self):
         index = min(self.projSlider.value, self.stack.shape[0] - 1)
@@ -337,5 +374,6 @@ class MotionCorrectionWindow:
             return (self.dx.copy(), self.dz.copy()) if accepted else None
         finally:
             self.cineTimer.stop()
+            self.reconTimer.stop()
             self.renderer.cleanup()
             self.plotRenderer.cleanup()

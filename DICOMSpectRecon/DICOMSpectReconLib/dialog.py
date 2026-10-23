@@ -27,8 +27,9 @@ DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
 # display reference, CT as (level, width) in HU
 DEFAULT_WINDOWS = {"activity": (0.0, display.WINDOW_FRACTION), "proj": (0.0, 1.0), "sino": (0.0, 1.0),
                    "ct": (display.CT_LEVEL, display.CT_WIDTH)}
-LINE_HINT = ("Left mouse button on the projections: drag the yellow line up/down. Every display window "
-             "(projections, sinogram, linogram, reconstruction) is scaled to the maximum on that line.")
+LINE_HINT = ("Left mouse button on the projections: drag the yellow line up/down; it follows the axial "
+             "slice and the slice follows it. The projection, linogram and reconstruction windows are scaled "
+             "to the maximum on that line.")
 WINDOW_HINT = ("Middle mouse button on a preview: drag left/right for the window width, up/down for the "
                "level; double-click to reset.")
 RR_AUTO = "Auto"
@@ -302,6 +303,8 @@ class SpectReconDialog:
         self.reconMax = 1.0
         self._reconFlipped = None  # reconstruction slice order against the projection rows
         self.lineSlice = None
+        self._lineSync = False  # the reference line and the axial slice follow each other
+        self.sinoSum = None
         self.sinoMax = 1.0
         self.linoMax = 1.0
         self.gateRawImages = []      # unfiltered per-gate recons in native units (cached)
@@ -474,11 +477,12 @@ class SpectReconDialog:
         else:
             sinoPlace, linoPlace = (3, column - 1), (3, column)
             lastColumn, nextRow = column, 4
-        self.sinoView, self.sinoSlider, self.sinoInfo, _ = self._makePanel(panels, "Sinogram", *sinoPlace)
+        self.sinoView, self.sinoSlider, self.sinoInfo, _ = self._makePanel(panels, "Summed sinogram", *sinoPlace)
+        self.sinoSlider.setVisible(False)  # holds the reference line row; the line is dragged on the projections
         self.linoView, _, self.linoInfo, _ = self._makePanel(panels, "Linogram", *linoPlace, withSlider=False)
-        self.sinoView.setToolTip("One projection row (axial position, chosen with the slider) for every angle, "
-                                 "first view at the top. A sideways patient movement shows as a jump in the "
-                                 "sine curves. Gates are summed.\n" + WINDOW_HINT)
+        self.sinoView.setToolTip("All projection rows summed along the axis (superior-inferior) for every "
+                                 "angle, first view at the top. A sideways patient movement shows as a jump in "
+                                 "the sine curves. Gates are summed.\n" + WINDOW_HINT)
         self.linoView.setToolTip("Axial count profile (top = row 1) of every angle, side by side from left to "
                                  "right. An up/down movement shows as a step. Gates are summed.\n" + WINDOW_HINT)
 
@@ -488,7 +492,7 @@ class SpectReconDialog:
         self.windowHint.setWordWrap(True)
         panels.addWidget(self.windowHint, nextRow, 0, 1, lastColumn + 1)
 
-        self.reconSlider.connect("valueChanged(int)", self.updateReconView)
+        self.reconSlider.connect("valueChanged(int)", self.onReconSliceChanged)
         self.projSlider.connect("valueChanged(int)", self.updateProjView)
         self.sinoSlider.connect("valueChanged(int)", self.onLineRowChanged)
 
@@ -509,7 +513,6 @@ class SpectReconDialog:
         self.projView.setToolTip(LINE_HINT + "\n" + WINDOW_HINT)
         self._installWindowDrag(self.sinoView, "sino")
         self._installWindowDrag(self.linoView, "sino")
-        self._installWheelScroll(self.sinoView, self.sinoSlider)
         self._installWindowDrag(self.ctView, "ct")
 
         if not self.ctFiles:
@@ -1691,6 +1694,13 @@ class SpectReconDialog:
         z = int(min(nz - 1, max(0, (row + 0.5) * nz / rows)))
         return nz - 1 - z if self._reconFlipped else z
 
+    def _rowForSlice(self, index):
+        """Projection row at a reconstruction slice (inverse of _reconSliceForRow)."""
+        nz, rows = self.reconArray.shape[0], self.sinoStack.shape[1]
+        self._reconSliceForRow(0)  # sets the slice order
+        z = nz - 1 - index if self._reconFlipped else index
+        return int(min(rows - 1, max(0, (z + 0.5) * rows / nz)))
+
     def _updateLineMaxima(self):
         """Display maxima from the voxels on the reference line, for every preview."""
         row = self.sinoSlider.value
@@ -1698,7 +1708,6 @@ class SpectReconDialog:
             self.projMax = float(self.projArray[:, row, :].max()) or float(self.projArray.max()) or 1.0
         if self.sinoStack is not None and self.sinoStack.size and row < self.sinoStack.shape[1]:
             line = self.sinoStack[:, row, :]
-            self.sinoMax = float(line.max()) or 1.0
             self.linoMax = float(line.sum(axis=1).max()) or 1.0
         if self.reconArray is not None and self.reconArray.size and self.sinoStack is not None:
             z = self._reconSliceForRow(row)
@@ -1713,8 +1722,30 @@ class SpectReconDialog:
         if self.projArray is not None:
             self.updateProjView(self.projSlider.value)
         self.updateSinoViews(row)
-        if self.reconArray is not None:
+        if self.reconArray is None:
+            return
+        if self.lineSlice is not None and not self._lineSync and self.reconSlider.value != self.lineSlice:
+            self._lineSync = True
+            try:
+                self.reconSlider.setValue(self.lineSlice)  # redraws through onReconSliceChanged
+            finally:
+                self._lineSync = False
+        else:
             self.updateReconView(self.reconSlider.value)
+
+    def onReconSliceChanged(self, index):
+        """Moving the axial slice moves the reference line to the same height, and back."""
+        if not self._lineSync and self.reconArray is not None and self.sinoStack is not None \
+                and self.sinoSlider.isEnabled():
+            row = self._rowForSlice(index)
+            if row != self.sinoSlider.value:
+                self._lineSync = True
+                try:
+                    self.sinoSlider.setValue(row)  # onLineRowChanged redraws the axial views too
+                finally:
+                    self._lineSync = False
+                return
+        self.updateReconView(index)
 
     def _redrawWindowGroup(self, group):
         a, b = self.windows[group]
@@ -2523,7 +2554,9 @@ class SpectReconDialog:
         nz = arr.shape[0]
         current = self.reconSlider.value
         self.reconSlider.setRange(0, nz - 1)
-        if not self.reconSlider.isEnabled() or current >= nz:
+        if self.lineSlice is not None and self.lineSlice < nz:
+            current = self.lineSlice  # at the reference line
+        elif not self.reconSlider.isEnabled() or current >= nz:
             current = nz // 2
         self.reconSlider.setEnabled(True)
         self.reconSlider.setValue(current)
@@ -2674,6 +2707,8 @@ class SpectReconDialog:
             self.projMax = 1.0
         stack = motion.slotStack(frames, raw["slots"], raw["ewv"], peakWindow)
         self.sinoStack = stack[raw["order"]]
+        self.sinoSum = self.sinoStack.sum(axis=1)  # summed along the axis, much less noisy than one row
+        self.sinoMax = float(self.sinoSum.max()) or 1.0
         rows = self.sinoStack.shape[1]
         first = not self.sinoSlider.isEnabled()
         self.sinoSlider.blockSignals(True)
@@ -2693,11 +2728,15 @@ class SpectReconDialog:
         if self.cineCheckBox.checked and not self.busy:
             self.startProjCine()
 
-    def _sinoImage(self, image, vmax):
-        """PET-coloured sinogram / linogram stretched to the square panel (aspect not kept)."""
+    def _sinoImage(self, image, vmax, lineRow=None, rows=None):
+        """PET-coloured sinogram / linogram stretched to the square panel (aspect not kept), with the
+        reference line when given."""
         lower, upper = self.windows["sino"]
         fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
-        return self.renderer.toPixmap(display.colorize(fitted, vmax, self._petColors(), upper, lower))
+        rgb = display.colorize(fitted, vmax, self._petColors(), upper, lower)
+        if lineRow is not None:
+            rgb = display.drawLine(rgb.copy(), lineRow, rows)
+        return self.renderer.toPixmap(rgb)
 
     def updateSinoViews(self, row):
         if self.sinoStack is None or not self.sinoStack.size:
@@ -2706,10 +2745,11 @@ class SpectReconDialog:
         nAngles = self.sinoStack.shape[0]
         summed = ", gates summed" if self.projGates is not None else ""
         corrected = ", motion corrected" if self.motion is not None else ""
-        self.sinoView.setPixmap(self._sinoImage(self.sinoStack[:, row, :], self.sinoMax))
-        self.sinoInfo.setText(f"Row {row + 1} / {self.sinoStack.shape[1]}   |   {nAngles} angles, "
+        self.sinoView.setPixmap(self._sinoImage(self.sinoSum, self.sinoMax))
+        self.sinoInfo.setText(f"All {self.sinoStack.shape[1]} rows summed   |   {nAngles} angles, "
                               f"first at the top{summed}{corrected}")
-        self.linoView.setPixmap(self._sinoImage(self.sinoStack.sum(axis=2).T, self.linoMax))
+        self.linoView.setPixmap(self._sinoImage(self.sinoStack.sum(axis=2).T, self.linoMax,
+                                                lineRow=row, rows=self.sinoStack.shape[1]))
         self.linoInfo.setText(f"{nAngles} angles left to right, axial row 1 at the top{summed}{corrected}")
 
     def updateProjView(self, index):
