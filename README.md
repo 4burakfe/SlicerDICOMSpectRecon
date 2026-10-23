@@ -45,7 +45,7 @@ Author: Burak Demir, MD, FEBNM
 - **Motion correction** (orange *Motion correction...* button): a separate window shows a fast
   reconstruction of the axial slice at the yellow line (2D, with the main window's algorithm,
   iterations, subsets, prior or FBP window and post-filter, without attenuation, scatter or resolution
-  recovery; computed in the background after 1 s without changes), the projections (in cine), the
+  recovery; computed one row at a time between window events after 1 s without changes), the projections (in cine), the
   summed sinogram and the linogram on the top row and the motion corrected ones below, with a plot of
   the shift of every view. *Detect* finds axial (up/down) movement by cross-correlating every view's
   axial count profile with the median profile [2], and sideways movement from the transaxial centre of

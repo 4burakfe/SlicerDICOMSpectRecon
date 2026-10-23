@@ -340,10 +340,8 @@ def writeCorrectedFile(sourceFile, outPath, dx, dz):
     maxStorable = float(2 ** int(getattr(ds, "BitsStored", 16)) - 1)
     shifted = np.clip(np.rint(shifted), 0, maxStorable).astype(frames.dtype)
     ds.PixelData = np.ascontiguousarray(shifted).tobytes()
-    ds.file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
-    ds.is_little_endian = True
-    ds.is_implicit_VR = False
-    ds.save_as(outPath, write_like_original=False)
+    from .nmdata import saveExplicitLittleEndian
+    saveExplicitLittleEndian(ds, outPath)
     return outPath
 
 
@@ -484,6 +482,14 @@ def reconstructSliceAt(recon, stack, row, params, pixelMm, log=lambda message: N
     """Axial slice at projection row `row` of stack [view, row, bin] with the main window's
     algorithm, iterations, subsets, prior or FBP window and post-filter. Neighbouring rows are
     reconstructed too, as far as the filters reach along the axis, and the filters run in 3D."""
+    for result in reconstructSliceSteps(recon, stack, row, params, pixelMm, log):
+        if result is not None:
+            return result
+
+
+def reconstructSliceSteps(recon, stack, row, params, pixelMm, log=lambda message: None):
+    """reconstructSliceAt in steps: yields None after each reconstructed row and the slice at the
+    end, so a window can run it from a timer between events instead of in a thread."""
     from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, BSREM_RELAXATION_ITERATIONS,
                                  BSREM_WARM_START_ITERATIONS, applyFilter, cutoffFraction,
                                  filterProjectionsFBP)
@@ -499,16 +505,21 @@ def reconstructSliceAt(recon, stack, row, params, pixelMm, log=lambda message: N
         data = np.stack([recon.binned(stack[:, r, :]) for r in rows], axis=2)   # [angle, bin, row]
         filtered = filterProjectionsFBP(data, fbp["window"], fraction, int(fbp.get("order", 10)), pixelR, pixelZ)
         slab = [np.maximum(recon.backprojectAll(filtered[:, :, k]), 0.0) for k in range(len(rows))]
-    elif algorithm == ALGORITHM_BSREM:
-        bsrem = params["bsrem"]
-        slab = [recon.bsrem(stack[:, r, :], bsrem["iters"], float(bsrem["beta"]), float(bsrem.get("gamma", 2.0)),
-                            BSREM_WARM_START_ITERATIONS, BSREM_RELAXATION_ITERATIONS) for r in rows]
     else:
-        slab = [recon.osem(stack[:, r, :], params["iters"]) for r in rows]
+        slab = []
+        for r in rows:
+            if algorithm == ALGORITHM_BSREM:
+                bsrem = params["bsrem"]
+                slab.append(recon.bsrem(stack[:, r, :], bsrem["iters"], float(bsrem["beta"]),
+                                        float(bsrem.get("gamma", 2.0)), BSREM_WARM_START_ITERATIONS,
+                                        BSREM_RELAXATION_ITERATIONS))
+            else:
+                slab.append(recon.osem(stack[:, r, :], params["iters"]))
+            yield None
     volume = np.stack(slab).astype(np.float32)   # [row, y, x]
     if params.get("filter") in ("Gaussian", "Butterworth", "Hann"):
         import SimpleITK as sitk
         image = sitk.GetImageFromArray(volume)
         image.SetSpacing((pixel * recon.binning, pixel * recon.binning, pixel))
         volume = sitk.GetArrayFromImage(applyFilter(image, params, log))
-    return volume[rows.index(row)]
+    yield volume[rows.index(row)]
