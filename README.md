@@ -22,10 +22,11 @@ Author: Burak Demir, MD, FEBNM
 
 - **OSEM** reconstruction with [PyTomography](https://github.com/qurit/PyTomography), with separate
   iterations/subsets for the static and the gated images.
-- **BSREM** (block sequential regularised EM) with a relative difference prior, the approach of GE
-  Q.Clear: OSEM-like subset updates with a decreasing step, started from one OSEM iteration, so it
-  converges. The prior strength beta sets the noise level (defaults: beta 0.6, gamma 2, 4 iterations; gates have their own beta, default 0.75) instead of the
-  iteration count, and no post-filter is needed.
+- **BSREM** (block sequential regularised EM, a Bayesian penalised-likelihood method, Q.Clear-like)
+  with a relative difference prior: OSEM-like subset updates with a decreasing step, started from one
+  OSEM iteration, so it converges and the prior strength beta, not the iteration count, sets the noise
+  level. Defaults: 4 iterations, beta 2.0 and gamma 2 for the static image, beta 0.4 and gamma 2 for the
+  gates, with the Butterworth post-filter left on.
 - **FBP** (filtered backprojection) as an alternative: ramp filter with a Ramp, Shepp-Logan, Cosine,
   Hamming, Hann or Butterworth window and a cutoff in cycles/cm (applied in 2D on the projections, like
   camera software). Scatter is subtracted from the projections and attenuation is corrected with the
