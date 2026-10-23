@@ -38,7 +38,7 @@ Author: Burak Demir, MD, FEBNM
   matched from the DICOM header (manufacturer, camera model, collimator name; e.g. a GE NM/CT 850/860/870
   "LEHRS" gets G8-LHRS: 1.43 mm holes, 0.13 mm septa, 32 mm long) or picked by hand. It raises contrast
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
-  While it is on, the iterations are multiplied by an "RR iterations" factor (x4 for OSEM, static and
+  While it is on, the iterations are multiplied by an "RR iterations" factor (x3 for OSEM, static and
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
 - **CT attenuation correction**: a CT of the same study (same frame of reference) is found
   automatically, or picked from a folder; it is also shown fused with the SPECT.
