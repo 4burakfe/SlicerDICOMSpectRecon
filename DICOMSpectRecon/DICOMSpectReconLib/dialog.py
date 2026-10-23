@@ -22,6 +22,13 @@ from . import display
 from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
+PROJ_MODES = ["Projections", "Sinogram", "Linogram"]
+# Display windows of the previews: activity and projections as (lower, upper) fractions of the
+# display reference, CT as (level, width) in HU
+DEFAULT_WINDOWS = {"activity": (0.0, display.WINDOW_FRACTION), "proj": (0.0, 1.0),
+                   "ct": (display.CT_LEVEL, display.CT_WIDTH)}
+WINDOW_HINT = ("Middle mouse button on a preview: drag left/right for the window width, up/down for the "
+               "level; double-click to reset.")
 RR_AUTO = "Auto"
 RR_OSEM_FACTOR = 2    # OSEM iterations x this with resolution recovery (slower convergence with the PSF)
 RR_BSREM_FACTOR = 2
@@ -156,6 +163,25 @@ def sameScatterWeight(a, b):
     return abs(float(a) - float(b)) < 1e-6
 
 
+def sinogramStack(frames, detectors=None, views=None):
+    """Projection frames [n, rows, cols] of one energy window as [angles, rows, cols]: frames of the
+    same detector and angular view (the gates of a gated study) are summed, ordered by detector and
+    view (detector 1 covers the first part of the orbit, detector 2 the next)."""
+    frames = np.asarray(frames, dtype=np.float32)
+    n = frames.shape[0]
+    if detectors is None or views is None or len(detectors) != n or len(views) != n:
+        return frames
+    keys = sorted({(int(d), int(v)) for d, v in zip(detectors, views)})
+    if len(keys) == n:
+        order = sorted(range(n), key=lambda i: (int(detectors[i]), int(views[i])))
+        return frames[order]
+    index = {key: i for i, key in enumerate(keys)}
+    stack = np.zeros((len(keys),) + frames.shape[1:], dtype=np.float32)
+    for i in range(n):
+        stack[index[(int(detectors[i]), int(views[i]))]] += frames[i]
+    return stack
+
+
 class WheelScrollFilter(qt.QObject):
     """Forwards mouse wheel events over a preview panel to a slider."""
 
@@ -171,6 +197,43 @@ class WheelScrollFilter(qt.QObject):
                 delta = event.delta()
             if delta != 0:
                 self.callback(1 if delta > 0 else -1)
+            return True
+        return False
+
+
+class WindowDragFilter(qt.QObject):
+    """Middle mouse button over a preview panel: drag to change the display window (callback gets the
+    drag in pixels since the press), double-click to reset it."""
+
+    def __init__(self, onStart, onDrag, onReset):
+        super().__init__()
+        self.onStart, self.onDrag, self.onReset = onStart, onDrag, onReset
+        self.origin = None
+
+    @staticmethod
+    def _xy(event):
+        try:
+            point = event.position()
+            return point.x(), point.y()
+        except AttributeError:
+            return event.pos().x(), event.pos().y()
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind == qt.QEvent.MouseButtonDblClick and event.button() == qt.Qt.MiddleButton:
+            self.origin = None
+            self.onReset()
+            return True
+        if kind == qt.QEvent.MouseButtonPress and event.button() == qt.Qt.MiddleButton:
+            self.origin = self._xy(event)
+            self.onStart()
+            return True
+        if kind == qt.QEvent.MouseMove and self.origin is not None:
+            x, y = self._xy(event)
+            self.onDrag(x - self.origin[0], y - self.origin[1])
+            return True
+        if kind == qt.QEvent.MouseButtonRelease and event.button() == qt.Qt.MiddleButton:
+            self.origin = None
             return True
         return False
 
@@ -218,6 +281,10 @@ class SpectReconDialog:
         self.projCineTimer = None
         self.gateCineTimer = None
         self.wheelFilters = []
+        self.windowFilters = []
+        self.windows = dict(DEFAULT_WINDOWS)
+        self.sinoStack = None        # photopeak projections by angle (gates summed): [angles, rows, cols]
+        self.projModeIndex = {}      # slider position of each projection display mode
         self.logic = None
         self.reconImage = None       # unfiltered static recon in native units (cached)
         self.reconStats = None
@@ -382,10 +449,26 @@ class SpectReconDialog:
         self.fpsSpin.setValue(10)
         self.fpsSpin.setSuffix(" fps")
         self.fpsSpin.connect("valueChanged(int)", self.onFpsChanged)
+        self.projModeCombo = qt.QComboBox()
+        self.projModeCombo.addItems(PROJ_MODES)
+        self.projModeCombo.setToolTip(
+            "Projections: the raw frames.\n"
+            "Sinogram: one projection row (axial position, chosen with the slider) for every angle - "
+            "a sideways patient movement shows as a jump in the sine curves.\n"
+            "Linogram: every projection summed across, i.e. the axial count profile for every angle - "
+            "an up/down (axial) movement shows as a step. Gates are summed.")
+        self.projModeCombo.connect("currentIndexChanged(int)", lambda index: self._applyProjMode())
+        cineRow.addWidget(self.projModeCombo)
         cineRow.addWidget(self.cineCheckBox)
         cineRow.addWidget(self.fpsSpin)
         cineRow.addStretch(1)
         panels.addLayout(cineRow, 2, column)
+
+        self.windowHint = qt.QLabel(WINDOW_HINT)
+        self.windowHint.setStyleSheet("color: gray;")
+        self.windowHint.setAlignment(qt.Qt.AlignCenter)
+        self.windowHint.setWordWrap(True)
+        panels.addWidget(self.windowHint, 3, 0, 1, column + 1)
 
         self.reconSlider.connect("valueChanged(int)", self.updateReconView)
         self.projSlider.connect("valueChanged(int)", self.updateProjView)
@@ -398,6 +481,12 @@ class SpectReconDialog:
         if self.isGated:
             self._installWheelScroll(self.gatedView, self.reconSlider)
             self._installWheelScroll(self.gatedFusionView, self.reconSlider)
+        activityViews = [self.reconView, self.fusionView] + \
+            ([self.gatedView, self.gatedFusionView] if self.isGated else [])
+        for view in activityViews:
+            self._installWindowDrag(view, "activity")
+        self._installWindowDrag(self.projView, "proj")
+        self._installWindowDrag(self.ctView, "ct")
 
         if not self.ctFiles:
             self.fusionPanel.setVisible(False)
@@ -1479,7 +1568,7 @@ class SpectReconDialog:
 
     def _installWheelScroll(self, view, slider, stopsCine=False):
         def step(direction):
-            if stopsCine and self.cineCheckBox.checked:
+            if stopsCine and self.cineCheckBox.checked and self._projMode() == "Projections":
                 self.cineCheckBox.setChecked(False)  # manual scrolling takes over
             if not slider.isEnabled():
                 return
@@ -1492,6 +1581,60 @@ class SpectReconDialog:
         except Exception:
             logging.warning("Mouse wheel scrolling not available:\n" + traceback.format_exc())
 
+    # ---------------- display window (middle mouse button) ----------------
+    def _installWindowDrag(self, view, group):
+        state = {}
+
+        def start():
+            state["window"] = self.windows[group]
+
+        def drag(dx, dy):
+            if "window" not in state:
+                return
+            a, b = state["window"]
+            size = float(self.viewSize)
+            if group == "ct":
+                level = a - dy / size * 1000.0
+                width = max(1.0, b + dx / size * 2000.0)
+                self.windows[group] = (level, width)
+            else:
+                centre, width = (a + b) / 2.0, b - a
+                width = max(0.01, width + dx / size)
+                centre = centre - dy / size
+                self.windows[group] = (centre - width / 2.0, centre + width / 2.0)
+            self._redrawWindowGroup(group)
+
+        def reset():
+            self.windows[group] = DEFAULT_WINDOWS[group]
+            self._redrawWindowGroup(group)
+
+        try:
+            windowFilter = WindowDragFilter(start, drag, reset)
+            view.installEventFilter(windowFilter)
+            view.setToolTip(WINDOW_HINT)
+            self.windowFilters.append(windowFilter)  # keep alive
+        except Exception:
+            logging.warning("Window adjustment not available:\n" + traceback.format_exc())
+
+    def _redrawWindowGroup(self, group):
+        a, b = self.windows[group]
+        if group == "ct":
+            text = f"CT window: level {a:.0f} HU, width {b:.0f} HU"
+        else:
+            name = "Activity" if group == "activity" else "Projection"
+            text = f"{name} window: {100 * a:.0f} % to {100 * b:.0f} % of the display maximum"
+        self.windowHint.setText(text + "   (middle double-click resets)")
+        if group == "proj":
+            self.updateProjView(self.projSlider.value)
+        elif group == "activity":
+            self.updateReconView(self.reconSlider.value)
+        else:
+            self.updateSliceViews(self.reconSlider.value)
+
+    def _activityWindow(self):
+        lower, upper = self.windows["activity"]
+        return {"windowFraction": upper, "lower": lower}
+
     def onCineToggled(self, checked):
         self.startProjCine() if checked else self.stopProjCine()
 
@@ -1500,7 +1643,7 @@ class SpectReconDialog:
             self.projCineTimer.setInterval(int(1000 / max(1, fps)))
 
     def startProjCine(self):
-        if self.projArray is None or self.projArray.shape[0] < 2:
+        if self.projArray is None or self.projArray.shape[0] < 2 or self._projMode() != "Projections":
             return
         if self.projCineTimer is None:
             self.projCineTimer = qt.QTimer()
@@ -1513,7 +1656,7 @@ class SpectReconDialog:
             self.projCineTimer.stop()
 
     def advanceProjCine(self):
-        if self.projArray is None:
+        if self.projArray is None or self._projMode() != "Projections":
             return
         self.projSlider.setValue((self.projSlider.value + 1) % self.projArray.shape[0])
 
@@ -2245,7 +2388,8 @@ class SpectReconDialog:
         if self.reconArray is None:
             return
         sl = self.reconArray[index]
-        self.reconView.setPixmap(self.renderer.toPixmap(display.colorize(self._fit(sl), self.reconMax, self._petColors())))
+        self.reconView.setPixmap(self.renderer.toPixmap(display.colorize(self._fit(sl), self.reconMax, self._petColors(),
+                                                                        **self._activityWindow())))
         self.reconInfo.setText(f"Slice {index + 1} / {self.reconArray.shape[0]}   |   slice sum: {sl.sum():.0f}")
         self.updateSliceViews(index)
 
@@ -2291,7 +2435,8 @@ class SpectReconDialog:
         if ct is None or index >= ct.shape[0]:
             return None, None
         ctSlice = ct[index]
-        return display.ctGray(ctSlice), ctSlice
+        level, width = self.windows["ct"]
+        return display.ctGray(ctSlice, level, width), ctSlice
 
     def updateFusionAndCtViews(self, index):
         if not self.ctFiles or self.ctPreviewFailed or self.reconArray is None:
@@ -2307,7 +2452,8 @@ class SpectReconDialog:
         self.ctInfo.setText(f"Slice {index + 1} / {self.reconArray.shape[0]}   |   "
                             f"HU range: {ctSlice.min():.0f} to {ctSlice.max():.0f}")
 
-        fused = display.fuse(self._fit(self.reconArray[index]), self.reconMax, ctGrayFit, self._opacity())
+        fused = display.fuse(self._fit(self.reconArray[index]), self.reconMax, ctGrayFit, self._opacity(),
+                             **self._activityWindow())
         self.fusionView.setPixmap(self.renderer.toPixmap(fused))
         self.fusionInfo.setText(f"Slice {index + 1}   |   opacity {self.opacitySlider.value}%")
 
@@ -2319,13 +2465,15 @@ class SpectReconDialog:
             return
         gateSlice = gateArray[index]
         gateSlice = self._fit(gateSlice)
-        self.gatedView.setPixmap(self.renderer.toPixmap(display.colorize(gateSlice, self.gateMax, self._petColors())))
+        self.gatedView.setPixmap(self.renderer.toPixmap(display.colorize(gateSlice, self.gateMax, self._petColors(),
+                                                                                  **self._activityWindow())))
         self.gatedInfo.setText(f"Gate {self.gateIndex + 1} / {len(self.gateArrays)}   |   "
                                f"slice {index + 1} / {gateArray.shape[0]}")
         if self.ctFiles:
             ctGray, _ = self._ctGraySlice(index)
             if ctGray is not None:
-                fused = display.fuse(gateSlice, self.gateMax, self._fit(ctGray, maximum=1.0), self._opacity())
+                fused = display.fuse(gateSlice, self.gateMax, self._fit(ctGray, maximum=1.0), self._opacity(),
+                                     **self._activityWindow())
                 self.gatedFusionView.setPixmap(self.renderer.toPixmap(fused))
                 self.gatedFusionInfo.setText(f"Gate {self.gateIndex + 1}   |   slice {index + 1}")
 
@@ -2347,7 +2495,8 @@ class SpectReconDialog:
                 return arr if arr.size == n else None
 
             self.rawProjection = {"frames": frames, "ewv": vector("EnergyWindowVector"),
-                                  "det": vector("DetectorVector"), "gates": vector("TimeSlotVector")}
+                                  "det": vector("DetectorVector"), "gates": vector("TimeSlotVector"),
+                                  "views": vector("AngularViewVector")}
             self._showRawProjections()
         except Exception as e:
             self.projView.setText("Could not read projections")
@@ -2370,18 +2519,67 @@ class SpectReconDialog:
         self.projMax = float(self.projArray.max()) if self.projArray.size else 1.0
         if self.projMax <= 0:
             self.projMax = 1.0
-        self.projSlider.setRange(0, self.projArray.shape[0] - 1)
-        self.projSlider.setEnabled(True)
-        index = min(self.projSlider.value, self.projArray.shape[0] - 1)
+        views = raw["views"][sel] if raw.get("views") is not None else None
+        self.sinoStack = sinogramStack(self.projArray, self.projDetectors, views)
+        self.sinoMax = float(self.sinoStack.max()) if self.sinoStack.size else 1.0
+        rowSums = self.sinoStack.sum(axis=(0, 2))
+        self.projModeIndex.setdefault("Sinogram", int(np.argmax(rowSums)) if rowSums.size else 0)
+        self._applyProjMode()
+
+    def _projMode(self):
+        return self.projModeCombo.currentText
+
+    def _applyProjMode(self):
+        """Slider range, cine and view for the chosen display: frames, sinogram rows or the linogram."""
+        if self.projArray is None:
+            return
+        mode = self._projMode()
+        if mode == "Projections":
+            count = self.projArray.shape[0]
+        elif mode == "Sinogram":
+            count = self.sinoStack.shape[1]
+        else:
+            count = 1
+        self.projSlider.blockSignals(True)
+        self.projSlider.setRange(0, max(0, count - 1))
+        index = min(self.projModeIndex.get(mode, 0), count - 1)
         self.projSlider.setValue(index)
-        self.updateProjView(index)
-        if self.cineCheckBox.checked and not self.busy:
+        self.projSlider.blockSignals(False)
+        self.projSlider.setEnabled(count > 1)
+        self.fpsSpin.setEnabled(mode == "Projections")
+        self.cineCheckBox.setEnabled(mode == "Projections")
+        if mode == "Projections" and self.cineCheckBox.checked and not self.busy:
             self.startProjCine()
+        else:
+            self.stopProjCine()
+        self.updateProjView(index)
 
     def updateProjView(self, index):
         if self.projArray is None:
             return
-        self.projView.setPixmap(self.renderer.toPixmap(display.grayscale(self._fit(self.projArray[index]), self.projMax)))
+        mode = self._projMode()
+        lower, upper = self.windows["proj"]
+        if mode != "Projections":
+            self.projModeIndex[mode] = index
+            if mode == "Sinogram":
+                image = self.sinoStack[:, index, :]
+                vmax = float(image.max()) or 1.0
+                text = (f"Sinogram, row {index + 1} / {self.sinoStack.shape[1]}   |   "
+                        f"{self.sinoStack.shape[0]} angles, top to bottom")
+            else:
+                image = self.sinoStack.sum(axis=2)
+                vmax = float(image.max()) or 1.0
+                text = (f"Linogram: axial profile (left = row 1) of {self.sinoStack.shape[0]} angles, "
+                        "top to bottom")
+            fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
+            self.projView.setPixmap(self.renderer.toPixmap(display.grayscale(fitted, vmax, upper, lower)))
+            if self.projGates is not None:
+                text += ", gates summed"
+            self.projInfo.setText(text)
+            return
+        self.projModeIndex[mode] = index
+        self.projView.setPixmap(self.renderer.toPixmap(
+            display.grayscale(self._fit(self.projArray[index]), self.projMax, upper, lower)))
         text = f"Projection {index + 1} / {self.projArray.shape[0]}"
         if self.projDetectors is not None:
             text += f"   |   Detector {int(self.projDetectors[index])}"

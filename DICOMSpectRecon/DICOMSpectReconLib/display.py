@@ -82,20 +82,22 @@ def petColorTable():
     return hotTable()
 
 
-def _normalized(activitySlice, vmax, windowFraction=WINDOW_FRACTION):
-    top = (vmax if vmax > 0 else 1.0) * windowFraction
-    return np.clip(activitySlice / top, 0.0, 1.0)
+def _normalized(activitySlice, vmax, windowFraction=WINDOW_FRACTION, lower=0.0):
+    """0..1 between lower x vmax and windowFraction x vmax."""
+    scale = vmax if vmax > 0 else 1.0
+    top, bottom = scale * windowFraction, scale * lower
+    return np.clip((activitySlice - bottom) / max(top - bottom, 1e-12 * scale), 0.0, 1.0)
 
 
-def colorize(activitySlice, vmax, table, windowFraction=WINDOW_FRACTION):
+def colorize(activitySlice, vmax, table, windowFraction=WINDOW_FRACTION, lower=0.0):
     """Activity slice -> RGB uint8 [h, w, 3] through a colour table."""
-    indices = (_normalized(activitySlice, vmax, windowFraction) * 255.0).astype(np.uint8)
+    indices = (_normalized(activitySlice, vmax, windowFraction, lower) * 255.0).astype(np.uint8)
     return table[indices]
 
 
-def grayscale(arr, vmax):
-    """Scalar slice scaled 0..vmax -> grey RGB uint8 [h, w, 3]."""
-    gray = (_normalized(arr, vmax, 1.0) * 255.0).astype(np.uint8)
+def grayscale(arr, vmax, windowFraction=1.0, lower=0.0):
+    """Scalar slice scaled 0..vmax (or the given window of it) -> grey RGB uint8 [h, w, 3]."""
+    gray = (_normalized(arr, vmax, windowFraction, lower) * 255.0).astype(np.uint8)
     return np.repeat(gray[..., np.newaxis], 3, axis=-1)
 
 
@@ -104,9 +106,9 @@ def ctGray(ctSlice, level=CT_LEVEL, width=CT_WIDTH):
     return np.clip((ctSlice - (level - width / 2.0)) / width, 0.0, 1.0)
 
 
-def fuse(activitySlice, vmax, ctGraySlice, opacity, windowFraction=WINDOW_FRACTION):
+def fuse(activitySlice, vmax, ctGraySlice, opacity, windowFraction=WINDOW_FRACTION, lower=0.0):
     """Hot colour activity over grey CT, opacity weighted by activity -> RGB uint8."""
-    activity = _normalized(activitySlice, vmax, windowFraction)
+    activity = _normalized(activitySlice, vmax, windowFraction, lower)
     hot = np.stack([np.clip(3 * activity, 0, 1),
                     np.clip(3 * activity - 1, 0, 1),
                     np.clip(3 * activity - 2, 0, 1)], axis=-1)
@@ -144,6 +146,16 @@ def fitSize(shape, size):
     h, w = shape[0], shape[1]
     scale = float(size) / max(h, w)
     return max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+
+
+def resampleCubicTo(arr, height, width, minimum=None, maximum=None):
+    """Scalar array resampled bicubically to exactly height x width (aspect not kept), e.g. a
+    sinogram with few angles stretched to the panel."""
+    arr = np.asarray(arr, dtype=np.float64)
+    out = _cubicWeights(arr.shape[0], height) @ arr @ _cubicWeights(arr.shape[1], width).T
+    if minimum is not None or maximum is not None:
+        out = np.clip(out, minimum, maximum)
+    return out.astype(np.float32)
 
 
 def resampleCubic(arr, size, minimum=None, maximum=None):
