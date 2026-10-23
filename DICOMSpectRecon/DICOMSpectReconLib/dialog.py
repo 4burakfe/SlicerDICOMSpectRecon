@@ -23,7 +23,7 @@ from . import quantification as quant
 
 DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss"
 RR_AUTO = "Auto"
-RR_OSEM_FACTOR = 4    # OSEM iterations x this with resolution recovery (slower convergence with the PSF)
+RR_OSEM_FACTOR = 3    # OSEM iterations x this with resolution recovery (slower convergence with the PSF)
 RR_BSREM_FACTOR = 2
 DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
