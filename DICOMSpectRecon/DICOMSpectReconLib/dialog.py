@@ -1954,7 +1954,7 @@ class SpectReconDialog:
             window = MotionCorrectionWindow(
                 self.dialog, raw["frames"], raw["slots"], raw["ewv"], max(0, self.peakCombo.currentIndex) + 1,
                 raw["angles"], raw["slotDetectors"], clockwise=raw["clockwise"], pixelMm=self.pixelMm,
-                initial=self.motion, log=self.log)
+                initial=self.motion, reconParams=self.currentParams(), log=self.log)
             result = window.exec()
         except Exception as e:
             logging.error(traceback.format_exc())

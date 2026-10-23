@@ -342,26 +342,31 @@ def writeCorrectedFile(sourceFile, outPath, dx, dz):
 
 
 # ---------------------------------------------------------------------------
-# Fast 2D reconstruction of one axial slice (one projection row), for the live preview
+# Fast 2D reconstruction of the axial slice at one projection row, for the live preview
 # ---------------------------------------------------------------------------
 SLICE_MAX_BINS = 128
-SLICE_ITERATIONS = 3
-SLICE_SUBSETS = 6
+SLICE_MAX_HALF_SLAB = 4       # rows on each side reconstructed for the axial part of the filters
 
 
 class SliceReconstructor:
-    """OSEM of a single projection row (a 1 pixel thick axial slice) with a parallel-hole
-    line-integral projector: no attenuation, scatter or resolution recovery, so it is quick
-    enough to follow the motion correction live. Wide projections are binned to at most
+    """2D reconstruction of single projection rows (1 pixel thick axial slices) with a parallel-hole
+    line-integral projector (bilinear, matching PyTomography's orientation): OSEM, BSREM with a
+    relative difference prior, or FBP. No attenuation, scatter or resolution recovery, so it is
+    quick enough to follow the motion correction live. Wide projections are binned to at most
     SLICE_MAX_BINS pixels."""
 
-    def __init__(self, angles, nBins, iterations=SLICE_ITERATIONS, subsets=SLICE_SUBSETS):
+    def __init__(self, angles, nBins, subsets=1):
         self.binning = int(np.ceil(nBins / SLICE_MAX_BINS))
-        self.nBins = nBins
         n = int(np.ceil(nBins / self.binning))
         self.n = n
-        self.iterations = iterations
-        theta = np.deg2rad(np.asarray(angles, dtype=np.float64))
+        nAngles = len(angles)
+        subsets = max(1, min(int(subsets), nAngles))
+        groups = [np.arange(k, nAngles, subsets) for k in range(subsets)]
+        # angles reordered so every subset is one contiguous block (slicing then copies nothing)
+        self.perm = np.concatenate(groups)
+        ends = np.cumsum([len(g) for g in groups])
+        self.blocks = list(zip(np.r_[0, ends[:-1]], ends))
+        theta = np.deg2rad(np.asarray(angles, dtype=np.float64)[self.perm])
         centre = (n - 1) / 2.0
         u = np.arange(n) - centre
         t = np.arange(n) - centre
@@ -378,40 +383,126 @@ class SliceReconstructor:
             inside = (yy >= 0) & (yy < n) & (xx >= 0) & (xx < n)
             indices.append(np.where(inside, yy * n + xx, 0).astype(np.int32))
             weights.append(np.where(inside, w, 0.0).astype(np.float32))
-        self.index = np.stack(indices, axis=-1)    # [angle, bin, depth, 4]
+        self.index = np.stack(indices, axis=-1)    # [angle (subset order), bin, depth, 4]
         self.weight = np.stack(weights, axis=-1)
-        nAngles = len(theta)
-        subsets = max(1, min(subsets, nAngles // 4))
-        self.subsets = [np.arange(s, nAngles, subsets) for s in range(subsets)]
-        self.sensitivity = [np.maximum(self._back(np.ones((len(a), n), np.float32), a), 1e-6)
-                            for a in self.subsets]
+        self.sensitivity = [np.maximum(self._back(np.ones((e - b, n), np.float32), b, e), 1e-6)
+                            for b, e in self.blocks]
+        self.sensitivityAll = np.maximum(sum(self.sensitivity), 1e-6)
         yy, xx = np.mgrid[0:n, 0:n] - centre
         self.fov = (xx ** 2 + yy ** 2 <= (n / 2.0) ** 2).astype(np.float32)
 
-    def _forward(self, image, angles):
-        flat = image.ravel()
-        return (flat[self.index[angles]] * self.weight[angles]).sum(axis=(2, 3))
+    def _forward(self, image, begin, end):
+        return (image.ravel()[self.index[begin:end]] * self.weight[begin:end]).sum(axis=(2, 3))
 
-    def _back(self, projection, angles):
-        weights = self.weight[angles] * projection[:, :, None, None]
-        out = np.bincount(self.index[angles].ravel(), weights=weights.ravel(), minlength=self.n * self.n)
+    def _back(self, projection, begin, end):
+        weights = self.weight[begin:end] * projection[:, :, None, None]
+        out = np.bincount(self.index[begin:end].ravel(), weights=weights.ravel(), minlength=self.n * self.n)
         return out.reshape(self.n, self.n).astype(np.float32)
 
-    def _bin(self, sinogram):
+    def binned(self, sinogram):
+        """[angle, bin] in the caller's angle order -> binned, in subset order."""
         sinogram = np.asarray(sinogram, dtype=np.float32)
-        if self.binning == 1:
-            return sinogram
-        pad = self.n * self.binning - sinogram.shape[1]
-        sinogram = np.pad(sinogram, ((0, 0), (0, pad)))
-        return sinogram.reshape(sinogram.shape[0], self.n, self.binning).sum(axis=2)
+        if self.binning > 1:
+            pad = self.n * self.binning - sinogram.shape[1]
+            sinogram = np.pad(sinogram, ((0, 0), (0, pad)))
+            sinogram = sinogram.reshape(sinogram.shape[0], self.n, self.binning).sum(axis=2)
+        return sinogram[self.perm]
 
-    def reconstruct(self, sinogram):
-        """sinogram [angle, bin] (angles as given to the constructor) -> image [n, n]."""
-        data = self._bin(sinogram)
-        image = self.fov.copy()
-        for _ in range(self.iterations):
-            for angles, sensitivity in zip(self.subsets, self.sensitivity):
-                estimate = np.maximum(self._forward(image, angles), 1e-6)
-                image *= self._back(data[angles] / estimate, angles) / sensitivity
+    def osem(self, sinogram, iterations, image=None):
+        data = self.binned(sinogram)
+        image = self.fov.copy() if image is None else image.copy()
+        for _ in range(int(iterations)):
+            for (begin, end), sensitivity in zip(self.blocks, self.sensitivity):
+                estimate = np.maximum(self._forward(image, begin, end), 1e-6)
+                image *= self._back(data[begin:end] / estimate, begin, end) / sensitivity
                 image *= self.fov
         return image
+
+    def bsrem(self, sinogram, iterations, beta, gamma, warmStart=1, relaxationIterations=10.0):
+        """BSREM as PyTomography runs it: an OSEM starting image, then per subset
+        x += alpha(n) x / (w H^T 1) (gradient of the subset likelihood - w beta grad R), with
+        alpha(n) = 1 / (1 + n / relaxationIterations) and w the subset's share of the views."""
+        data = self.binned(sinogram)
+        image = self.osem(sinogram, warmStart)
+        nAngles = data.shape[0]
+        for iteration in range(int(iterations)):
+            alpha = 1.0 / (1.0 + iteration / relaxationIterations)
+            for (begin, end), sensitivity in zip(self.blocks, self.sensitivity):
+                share = (end - begin) / nAngles
+                estimate = np.maximum(self._forward(image, begin, end), 1e-6)
+                gradient = self._back(data[begin:end] / estimate, begin, end) - sensitivity
+                if beta > 0:
+                    gradient -= share * beta * rdpGradient(image, gamma)
+                image = np.maximum(image + alpha * image / (share * self.sensitivityAll) * gradient, 0.0)
+                image *= self.fov
+        return image.astype(np.float32)
+
+    def backprojectAll(self, filtered):
+        """(pi / views) x backprojection of filtered [angle, bin] (subset order) data, for FBP."""
+        return self._back(np.asarray(filtered, dtype=np.float32), 0, filtered.shape[0]) \
+            * (np.pi / filtered.shape[0]) * self.fov
+
+
+def rdpGradient(image, gamma):
+    """Gradient of the relative difference prior over the 8 in-plane neighbours (weights 1/distance):
+    sum_k w (x_j - x_k)(gamma |x_j - x_k| + x_j + 3 x_k) / (x_j + x_k + gamma |x_j - x_k|)^2."""
+    padded = np.pad(image, 1, mode="edge")
+    n0, n1 = image.shape
+    out = np.zeros_like(image, dtype=np.float64)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            neighbour = padded[1 + dy:1 + dy + n0, 1 + dx:1 + dx + n1]
+            diff = image - neighbour
+            denominator = image + neighbour + gamma * np.abs(diff) + 1e-9
+            out += (diff * (gamma * np.abs(diff) + image + 3 * neighbour) / denominator ** 2) / np.hypot(dy, dx)
+    return out.astype(np.float32)
+
+
+def sliceHalfSlab(params, pixelMm):
+    """Rows on each side of the line needed for the axial extent of the filters."""
+    pixel = float(pixelMm or 4.0)
+    half = 0
+    name = params.get("filter")
+    if name == "Gaussian":
+        half = int(np.ceil(float(params.get("fwhm", 0.0)) / pixel))
+    elif name in ("Butterworth", "Hann"):
+        half = 3
+    if params.get("algorithm") == "FBP" and params.get("fbp", {}).get("window") not in (None, "Ramp"):
+        half = max(half, 3)
+    return min(half, SLICE_MAX_HALF_SLAB)
+
+
+def reconstructSliceAt(recon, stack, row, params, pixelMm, log=lambda message: None):
+    """Axial slice at projection row `row` of stack [view, row, bin] with the main window's
+    algorithm, iterations, subsets, prior or FBP window and post-filter. Neighbouring rows are
+    reconstructed too, as far as the filters reach along the axis, and the filters run in 3D."""
+    from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, BSREM_RELAXATION_ITERATIONS,
+                                 BSREM_WARM_START_ITERATIONS, applyFilter, cutoffFraction,
+                                 filterProjectionsFBP)
+    pixel = float(pixelMm or 4.0)
+    nRows = stack.shape[1]
+    half = sliceHalfSlab(params, pixel)
+    rows = list(range(max(0, row - half), min(nRows, row + half + 1)))
+    algorithm = params.get("algorithm")
+    if algorithm == ALGORITHM_FBP:
+        fbp = params["fbp"]
+        pixelR, pixelZ = pixel * recon.binning / 10.0, pixel / 10.0   # cm
+        fraction, _ = cutoffFraction(float(fbp.get("cutoff", 1.0)), 10.0 * pixelR)
+        data = np.stack([recon.binned(stack[:, r, :]) for r in rows], axis=2)   # [angle, bin, row]
+        filtered = filterProjectionsFBP(data, fbp["window"], fraction, int(fbp.get("order", 10)), pixelR, pixelZ)
+        slab = [np.maximum(recon.backprojectAll(filtered[:, :, k]), 0.0) for k in range(len(rows))]
+    elif algorithm == ALGORITHM_BSREM:
+        bsrem = params["bsrem"]
+        slab = [recon.bsrem(stack[:, r, :], bsrem["iters"], float(bsrem["beta"]), float(bsrem.get("gamma", 2.0)),
+                            BSREM_WARM_START_ITERATIONS, BSREM_RELAXATION_ITERATIONS) for r in rows]
+    else:
+        slab = [recon.osem(stack[:, r, :], params["iters"]) for r in rows]
+    volume = np.stack(slab).astype(np.float32)   # [row, y, x]
+    if params.get("filter") in ("Gaussian", "Butterworth", "Hann"):
+        import SimpleITK as sitk
+        image = sitk.GetImageFromArray(volume)
+        image.SetSpacing((pixel * recon.binning, pixel * recon.binning, pixel))
+        volume = sitk.GetArrayFromImage(applyFilter(image, params, log))
+    return volume[rows.index(row)]
