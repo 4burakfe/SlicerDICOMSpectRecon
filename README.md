@@ -67,6 +67,12 @@ Author: Burak Demir, MD, FEBNM
    and the settings (OSEM, BSREM or FBP, attenuation, scatter, filter, scaling, quantification).
 3. Press **Reconstruct**, check the preview, then **Load into Slicer**.
 
+The raw projection panel can also show a **sinogram** (one projection row for every angle; a sideways
+patient movement shows as a jump in the sine curves) or a **linogram** (the axial count profile of every
+angle; an up/down movement shows as a step), with the gates of a gated study summed. On every preview,
+drag with the **middle mouse button** to change the display window (left/right: width, up/down: level);
+a middle double-click resets it.
+
 ### SPECT Calibration module
 
 1. Reconstruct a phantom of known activity with CT attenuation correction (and scatter correction if wanted).
