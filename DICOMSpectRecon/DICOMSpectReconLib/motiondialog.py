@@ -58,8 +58,10 @@ class MotionCorrectionWindow:
     """Modal window. exec() returns (dx, dz) per slot when the user accepts, else None."""
 
     def __init__(self, parent, frames, slots, energyWindows, peakWindow, angles, slotDetectors,
-                 clockwise=True, pixelMm=None, initial=None, log=print):
+                 clockwise=True, pixelMm=None, initial=None, reconParams=None, log=print):
         self.log = log
+        # the main window's reconstruction settings (algorithm, iterations, subsets, prior, filter)
+        self.reconParams = reconParams or {"algorithm": "OSEM", "iters": 3, "subsets": 6, "filter": "None"}
         self.slots = slots
         self.slotDetectors = np.asarray(slotDetectors, dtype=int)
         self.angles = np.asarray(angles, dtype=float)
@@ -131,12 +133,14 @@ class MotionCorrectionWindow:
         sliders.addWidget(self.rowLabel, 1, 2)
         sliders.setColumnStretch(1, 1)
         views.addLayout(sliders, 3, 1, 1, 4)
-        caption = qt.QLabel("Drag the yellow line on the projections (left mouse button) to pick the axial "
-                            "level. The axial slice there (1 pixel thick) is reconstructed 1 s after the last "
-                            "change with a quick 2D OSEM (no attenuation, scatter or resolution recovery), "
-                            "original and corrected on the same scale. The sinogram is all rows summed along "
-                            "the axis, views along the rotation from the top; the linogram has the views left "
-                            "to right and axial row 1 at the top. Photopeak window, gates summed.")
+        caption = qt.QLabel("Drag the yellow line on the projections (left mouse button) or turn the mouse "
+                            "wheel over the axial, sinogram or linogram views to pick the axial level; the wheel "
+                            "over the projections steps through them. The axial slice at the line is "
+                            "reconstructed 1 s after the last change with the main window's settings "
+                            f"({self.reconDescription()}), original and corrected on the same scale. "
+                            "The sinogram is all rows summed along the axis, views along the rotation from "
+                            "the top; the linogram has the views left to right and axial row 1 at the top. "
+                            "Photopeak window, gates summed.")
         caption.setWordWrap(True)
         caption.setStyleSheet("color: gray;")
         views.addWidget(caption, 4, 1, 1, 4)
@@ -150,8 +154,12 @@ class MotionCorrectionWindow:
         views.addWidget(legend, 6, 1, 1, 4)
 
         self.lineFilters = []
+        self.wheelFilters = []
         for kind in ("original", "corrected"):
             self._installLineDrag(self.views[(kind, "projection")])
+            self._installWheel(self.views[(kind, "projection")], self.projSlider, stopsCine=True)
+            for image in ("axial", "sinogram", "linogram"):
+                self._installWheel(self.views[(kind, image)], self.rowSlider)
 
         self.reconTimer = qt.QTimer()
         self.reconTimer.setSingleShot(True)
@@ -212,6 +220,9 @@ class MotionCorrectionWindow:
         self.manualDzSpin = self._doubleSpin(-30.0, 30.0, 0.5, 0.0, " px", "Axial shift added (+ = down)")
         addButton = qt.QPushButton("Add to these views")
         addButton.connect("clicked()", self.onManual)
+        self.fromSpin.connect("valueChanged(int)", lambda value: self._showStep(value - 1))
+        self.toSpin.connect("valueChanged(int)", lambda value: self._showStep(value - 1))
+        self.detectorCombo.connect("currentIndexChanged(int)", lambda index: self._showStep(self.fromSpin.value - 1))
         manualForm.addRow("Detector:", self.detectorCombo)
         manualForm.addRow("From step:", self.fromSpin)
         manualForm.addRow("To step:", self.toSpin)
@@ -238,6 +249,30 @@ class MotionCorrectionWindow:
         buttons.addWidget(okButton)
         buttons.addWidget(cancelButton)
         side.addLayout(buttons)
+
+    def _installWheel(self, view, slider, stopsCine=False):
+        from .dialog import WheelScrollFilter
+
+        def step(direction):
+            if stopsCine:
+                self.cineCheck.setChecked(False)
+            slider.setValue(max(slider.minimum, min(slider.maximum, slider.value + direction)))
+        try:
+            wheelFilter = WheelScrollFilter(step)
+            view.installEventFilter(wheelFilter)
+            self.wheelFilters.append(wheelFilter)  # keep alive
+        except Exception:
+            self.log("Mouse wheel scrolling not available")
+
+    def _showStep(self, step):
+        """Stop the cine and show the projection of a manual time step (on the chosen detector)."""
+        self.cineCheck.setChecked(False)
+        detectors = np.unique(self.slotDetectors)
+        index = self.detectorCombo.currentIndex
+        detector = int(detectors[index - 1]) if index > 0 else int(detectors[0])
+        slots = np.where((self.slotDetectors == detector) & (self.times == step))[0]
+        if slots.size:
+            self.projSlider.setValue(int(np.where(self.order == slots[0])[0][0]))
 
     def _installLineDrag(self, view):
         from .dialog import LineDragFilter
@@ -328,11 +363,14 @@ class MotionCorrectionWindow:
     def _reconstructSlice(self):
         row = self.rowSlider.value
         try:
+            params = self.reconParams
             if self.sliceRecon is None:
-                self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2])
+                subsets = params.get("subsets", 1) if params.get("algorithm") != "FBP" else 1
+                self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2], subsets)
             if self.originalSlice is None or self.originalSlice[0] != row:
-                self.originalSlice = (row, self.sliceRecon.reconstruct(self.stack[:, row, :]))
-            corrected = self.sliceRecon.reconstruct(self.corrected[:, row, :])
+                self.originalSlice = (row, motion.reconstructSliceAt(self.sliceRecon, self.stack, row, params,
+                                                                     self.pixelMm))
+            corrected = motion.reconstructSliceAt(self.sliceRecon, self.corrected, row, params, self.pixelMm)
         except Exception as e:
             self.log(f"Fast slice reconstruction failed: {e}")
             return
@@ -341,7 +379,21 @@ class MotionCorrectionWindow:
         for kind, image in (("original", original), ("corrected", corrected)):
             view = self.views[(kind, "axial")]
             view.setPixmap(self._colour(image, vmax))
-            view.setToolTip(f"Axial slice at line {row + 1}, 1 pixel thick (fast 2D OSEM, no attenuation)")
+            view.setToolTip(f"Axial slice at line {row + 1}: {self.reconDescription()}")
+
+    def reconDescription(self):
+        params = self.reconParams
+        algorithm = params.get("algorithm", "OSEM")
+        if algorithm == "FBP":
+            text = f"FBP {params['fbp']['window']}"
+        elif algorithm == "BSREM":
+            bsrem = params["bsrem"]
+            text = f"BSREM {bsrem['iters']} it x {params.get('subsets')} subsets, beta {bsrem['beta']:g}"
+        else:
+            text = f"OSEM {params.get('iters')} it x {params.get('subsets')} subsets"
+        if params.get("filter") not in (None, "None"):
+            text += f", {params['filter']} filter"
+        return text + "; 2D, no attenuation, scatter or RR"
 
     def _refreshProjections(self):
         index = min(self.projSlider.value, self.stack.shape[0] - 1)
