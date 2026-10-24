@@ -2736,7 +2736,7 @@ class SpectReconDialog:
         """PET-coloured sinogram / linogram (RGB) stretched to the square panel (aspect not kept), with
         the reference line when given."""
         lower, upper = self.windows["sino"]
-        fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
+        fitted = display.resampleNearestTo(image, self.viewSize, self.viewSize)
         rgb = display.colorize(fitted, vmax, self._petColors(), upper, lower)
         if lineRow is not None:
             rgb = display.drawLine(rgb.copy(), lineRow, rows)

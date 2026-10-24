@@ -77,6 +77,7 @@ class MotionCorrectionWindow:
         self.corrected = None
         self.sliceRecon = None        # motion.SliceReconstructor, made on first use
         self.originalSlice = None     # (row, image) of the uncorrected slice
+        self._showingStep = False
         self.sinoImages = {}          # (kind, "sinogram" / "linogram") -> RGB without the frame marker
         self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
@@ -119,7 +120,7 @@ class MotionCorrectionWindow:
         sliders.addWidget(self.cineCheck, 0, 0)
         self.projSlider = qt.QSlider(qt.Qt.Horizontal)
         self.projSlider.setRange(0, self.stack.shape[0] - 1)
-        self.projSlider.connect("valueChanged(int)", lambda value: self._refreshProjections())
+        self.projSlider.connect("valueChanged(int)", self._onFrameChanged)
         self.projSlider.connect("sliderPressed()", lambda: self.cineCheck.setChecked(False))
         sliders.addWidget(self.projSlider, 0, 1)
         self.projLabel = qt.QLabel("")
@@ -294,7 +295,33 @@ class MotionCorrectionWindow:
         detector = int(detectors[index - 1]) if index > 0 else int(detectors[0])
         slots = np.where((self.slotDetectors == detector) & (self.times == step))[0]
         if slots.size:
-            self.projSlider.setValue(int(np.where(self.order == slots[0])[0][0]))
+            self._showingStep = True   # the step chose the frame; the frame must not choose the step back
+            try:
+                self.projSlider.setValue(int(np.where(self.order == slots[0])[0][0]))
+            finally:
+                self._showingStep = False
+
+    def _onFrameChanged(self, index):
+        """A frame picked by hand (slider, wheel) becomes the manual step in single view mode; the
+        cine moves the slider without signals, so it leaves the step alone."""
+        self._refreshProjections()
+        if self.modeCombo.currentIndex != 0 or self._showingStep:
+            return
+        slot = int(self.order[min(index, len(self.order) - 1)])
+        step = int(self.times[slot])
+        detectorIndex = self.detectorCombo.currentIndex
+        if detectorIndex > 0:   # one detector chosen: follow the detector of the frame
+            detectorIndex = int(np.where(np.unique(self.slotDetectors) == self.slotDetectors[slot])[0][0]) + 1
+        if step == self.fromSpin.value - 1 and detectorIndex == self.detectorCombo.currentIndex:
+            return
+        for widget, value in ((self.fromSpin, step + 1), (self.detectorCombo, detectorIndex)):
+            widget.blockSignals(True)
+            if widget is self.fromSpin:
+                widget.setValue(value)
+            else:
+                widget.setCurrentIndex(value)
+            widget.blockSignals(False)
+        self._newManualBase()
 
     def _installLineDrag(self, view):
         from .dialog import LineDragFilter
@@ -395,9 +422,11 @@ class MotionCorrectionWindow:
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
-    def _colour(self, image, vmax, lineRow=None, rows=None, asArray=False):
-        """PET-coloured, stretched to the square view (aspect not kept), with the reference line if given."""
-        rgb = display.colorize(_fitTo(image, VIEW_SIZE), vmax or 1.0, self.petColors, 1.0)
+    def _colour(self, image, vmax, lineRow=None, rows=None, asArray=False, nearest=False):
+        """PET-coloured, stretched to the square view (aspect not kept), with the reference line if given;
+        nearest neighbour (sinograms, linograms) or bicubic (axial slice)."""
+        fitted = display.resampleNearestTo(image, VIEW_SIZE, VIEW_SIZE) if nearest else _fitTo(image, VIEW_SIZE)
+        rgb = display.colorize(fitted, vmax or 1.0, self.petColors, 1.0)
         if lineRow is not None:
             display.drawLine(rgb, lineRow, rows)
         return rgb if asArray else self.renderer.toPixmap(rgb)
@@ -418,8 +447,10 @@ class MotionCorrectionWindow:
         sinoMax = float(original.sum(axis=1).max())
         linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
-            self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, asArray=True)
-            self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, row, rows, asArray=True)
+            self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, asArray=True,
+                                                               nearest=True)
+            self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, row, rows,
+                                                               asArray=True, nearest=True)
         self._refreshProjections()
         self._scheduleRecon()
 
