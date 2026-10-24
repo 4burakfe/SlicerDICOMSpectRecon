@@ -93,7 +93,8 @@ axis for every view, in the order of the rotation, first view at the top; a side
 shows as a jump in the sine curves) and a **linogram** (the axial count profile of every view, views left
 to right; an up/down movement shows as a step), in PET-DICOM colours and stretched to the square panel,
 with the gates of a gated study summed. They sit in a row below the previews, or in a column on the right
-when a CT is shown. A yellow line over the rotating projections (drag it with the left mouse button)
+when a CT is shown. A dashed green line marks the projection shown (across the sinogram, up and
+down on the linogram), here and in the motion correction window. A yellow line over the rotating projections (drag it with the left mouse button)
 follows the axial slice, and the slice follows it; the projection, linogram and reconstruction windows
 are scaled to the maximum on that line. On every preview,
 drag with the **middle mouse button** to change the display window (left/right: width, up/down: level);
