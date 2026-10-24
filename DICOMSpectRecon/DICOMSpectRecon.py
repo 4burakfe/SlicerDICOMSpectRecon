@@ -110,6 +110,17 @@ def showAndCenterVolume(volumeNodeID, ctNodeID=None):
 # ---------------------------------------------------------------------------
 # Module registration (hidden module, only used by the DICOM browser)
 # ---------------------------------------------------------------------------
+
+def uniqueNodeName(name):
+    """name itself when no node in the scene has it, else name_2, name_3, ... (Slicer's
+    GenerateUniqueName adds _1 even when the name is free)."""
+    if slicer.mrmlScene.GetFirstNodeByName(name) is None:
+        return name
+    index = 2
+    while slicer.mrmlScene.GetFirstNodeByName(f"{name}_{index}") is not None:
+        index += 1
+    return f"{name}_{index}"
+
 class DICOMSpectRecon:
     def __init__(self, parent):
         parent.title = "DICOM SPECT Reconstruction"
@@ -293,7 +304,7 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
         algorithm = info.get("Algorithm", "OSEM")
         if algorithm != "OSEM" and " OSEM" in baseName:
             baseName = baseName.replace(" OSEM", f" {algorithm}", 1)
-        nodeName = slicer.mrmlScene.GenerateUniqueName(f"{baseName} {suffix}{unitSuffix}")
+        nodeName = uniqueNodeName(f"{baseName} {suffix}{unitSuffix}")
         volumeNode = sitkUtils.PushVolumeToSlicer(image, name=nodeName)
 
         # Keep reconstruction settings with the volume (traceability for dosimetry)
@@ -334,7 +345,7 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
         try:
             import sitkUtils
             gateNumbers = list(gateNumbers or range(1, len(gateImages) + 1))
-            baseName = slicer.mrmlScene.GenerateUniqueName(name)
+            baseName = uniqueNodeName(name)
             sequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", baseName)
             sequenceNode.SetIndexName("Gate")
             sequenceNode.SetIndexUnit("")
@@ -442,7 +453,7 @@ def loadCtForFusion(ctFiles):
         import sitkUtils
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(list(ctFiles))
-        return sitkUtils.PushVolumeToSlicer(reader.Execute(), name=slicer.mrmlScene.GenerateUniqueName("CT"))
+        return sitkUtils.PushVolumeToSlicer(reader.Execute(), name=uniqueNodeName("CT"))
     except Exception:
         logging.warning("Could not load the CT for fusion display:\n" + traceback.format_exc())
         return None
