@@ -321,6 +321,7 @@ class SpectReconDialog:
         self.projMax = 1.0
         self.projDetectors = None
         self.projGates = None
+        self.gatesSummed = False     # gated study: the preview projections are the gates summed
         self.busy = False
         self.abortRequested = False
         self.lastRunFailed = False   # shown in the action panel instead of "settings changed"
@@ -2712,6 +2713,13 @@ class SpectReconDialog:
         position = np.empty(len(raw["order"]), dtype=int)   # slot -> row of the sinogram
         position[np.asarray(raw["order"])] = np.arange(len(raw["order"]))
         self.projSinoRows = position[np.asarray(raw["slots"])[sel]]
+        self.gatesSummed = raw["gates"] is not None and len(np.unique(raw["gates"][sel])) > 1
+        if self.gatesSummed:   # gated: the preview shows every view once, with the gates summed
+            self.projArray = stack
+            self.projDetectors = np.asarray(raw["slotDetectors"])
+            self.projGates = None
+            self.projSinoRows = position
+            self.projMax = float(stack.max()) or 1.0
         self.sinoSum = self.sinoStack.sum(axis=1)  # summed along the axis, much less noisy than one row
         self.sinoMax = float(self.sinoSum.max()) or 1.0
         rows = self.sinoStack.shape[1]
@@ -2758,7 +2766,7 @@ class SpectReconDialog:
             return
         row = min(max(0, row), self.sinoStack.shape[1] - 1)
         nAngles = self.sinoStack.shape[0]
-        summed = ", gates summed" if self.projGates is not None else ""
+        summed = ", gates summed" if self.gatesSummed else ""
         corrected = ", motion corrected" if self.motion is not None else ""
         self.sinoInfo.setText(f"All {self.sinoStack.shape[1]} rows summed   |   {nAngles} angles, "
                               f"first at the top{summed}{corrected}")
@@ -2783,4 +2791,6 @@ class SpectReconDialog:
             text += f"   |   Detector {int(self.projDetectors[index])}"
         if self.projGates is not None:
             text += f"   |   Gate {int(self.projGates[index])}"
+        elif self.gatesSummed:
+            text += "   |   Gates summed"
         self.projInfo.setText(text)
