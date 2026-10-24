@@ -2,8 +2,6 @@
 axial slice at the reference line, the projections (cine), the summed sinogram and the linogram are shown
 on the top row, the motion corrected ones below, with a plot of the shifts."""
 
-import threading
-
 import numpy as np
 import qt
 
@@ -14,7 +12,6 @@ VIEW_SIZE = 240
 PLOT_HEIGHT = 170
 PLOT_WIDTH = 4 * VIEW_SIZE + 30
 RECON_DELAY_MS = 1000         # the slice is reconstructed after 1 s without changes
-RECON_POLL_MS = 50            # how often the window looks for a finished background slice
 CINE_INTERVAL_MS = 120
 DX_COLOUR = (255, 150, 40)    # lateral
 DZ_COLOUR = (60, 200, 255)    # axial
@@ -129,8 +126,7 @@ class MotionCorrectionWindow:
         sliders.addWidget(qt.QLabel("Line:"), 1, 0)
         self.rowSlider = qt.QSlider(qt.Qt.Horizontal)
         self.rowSlider.setRange(0, self.stack.shape[1] - 1)
-        rowSums = self.stack.sum(axis=(0, 2))
-        self.rowSlider.setValue(int(np.argmax(rowSums)) if rowSums.size else 0)
+        self.rowSlider.setValue(self.stack.shape[1] // 2)   # start at the middle slice
         self.rowSlider.connect("valueChanged(int)", lambda value: self._refreshImages())
         sliders.addWidget(self.rowSlider, 1, 1)
         self.rowLabel = qt.QLabel("")
@@ -169,10 +165,10 @@ class MotionCorrectionWindow:
         self.reconTimer.setSingleShot(True)
         self.reconTimer.setInterval(RECON_DELAY_MS)
         self.reconTimer.connect("timeout()", self._reconstructSlice)
-        self.reconPoll = qt.QTimer()
-        self.reconPoll.setInterval(RECON_POLL_MS)
-        self.reconPoll.connect("timeout()", self._collectSlice)
-        self.reconJob = None          # (thread, request number, result holder) of the running slice
+        self.reconStep = qt.QTimer()  # runs the slice one row at a time between window events
+        self.reconStep.setInterval(0)
+        self.reconStep.connect("timeout()", self._stepSlice)
+        self.reconJob = None          # (row, request number, step generators, results) of the running slice
         self.reconRequest = 0
 
         self.cineTimer = qt.QTimer()
@@ -421,46 +417,61 @@ class MotionCorrectionWindow:
         self.reconTimer.start()
 
     def _reconstructSlice(self):
-        """Start the slice in a background thread, so the window stays responsive."""
-        if self.reconJob is not None:
-            self.reconTimer.start()  # one at a time: try again when the running one is done
+        """Start the slice. Slicer's Python does not run threads while the window waits for events,
+        so the work is done in small steps (one row each) from a zero-interval timer instead: the
+        window stays responsive and a newer change abandons the running slice."""
+        row, params = self.rowSlider.value, self.reconParams
+        try:
+            if self.sliceRecon is None:
+                subsets = params.get("subsets", 1) if params.get("algorithm") != "FBP" else 1
+                self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2], subsets)
+        except Exception as e:
+            self.log(f"Fast slice reconstruction failed: {e}")
             return
-        row, request = self.rowSlider.value, self.reconRequest
-        params, corrected = self.reconParams, self.corrected
-        original = self.originalSlice if self.originalSlice is not None and self.originalSlice[0] == row else None
-        holder = {}
+        steps, results = [], {}
+        if self.originalSlice is not None and self.originalSlice[0] == row:
+            results["original"] = self.originalSlice[1]
+        else:
+            steps.append(("original", motion.reconstructSliceSteps(self.sliceRecon, self.stack, row, params,
+                                                                   self.pixelMm, self.log)))
+        steps.append(("corrected", motion.reconstructSliceSteps(self.sliceRecon, self.corrected, row, params,
+                                                                self.pixelMm, self.log)))
+        self.reconJob = (row, self.reconRequest, steps, results)
+        self.reconStep.start()
 
-        def work():
-            try:
-                if self.sliceRecon is None:
-                    subsets = params.get("subsets", 1) if params.get("algorithm") != "FBP" else 1
-                    self.sliceRecon = motion.SliceReconstructor(self.angles, self.stack.shape[2], subsets)
-                first = original
-                if first is None:
-                    first = (row, motion.reconstructSliceAt(self.sliceRecon, self.stack, row, params, self.pixelMm))
-                holder["result"] = (row, first, motion.reconstructSliceAt(self.sliceRecon, corrected, row,
-                                                                          params, self.pixelMm))
-            except Exception as e:
-                holder["error"] = e
-
-        thread = threading.Thread(target=work, daemon=True)
-        self.reconJob = (thread, request, holder)
-        thread.start()
-        self.reconPoll.start()
-
-    def _collectSlice(self):
-        if self.reconJob is None or self.reconJob[0].is_alive():
+    def _stepSlice(self):
+        if self.reconJob is None:
+            self.reconStep.stop()
             return
-        _, request, holder = self.reconJob
+        row, request, steps, results = self.reconJob
+        if request != self.reconRequest:   # settings changed: the newer request starts after its wait
+            self.reconJob = None
+            self.reconStep.stop()
+            return
+        try:
+            kind, generator = steps[0]
+            result = next(generator)
+        except StopIteration:
+            result = None
+            steps.pop(0)
+        except Exception as e:
+            self.reconJob = None
+            self.reconStep.stop()
+            self.log(f"Fast slice reconstruction failed: {e}")
+            return
+        if result is not None:
+            results[kind] = result
+            steps.pop(0)
+            if kind == "original":
+                self.originalSlice = (row, result)
+        if steps:
+            return
         self.reconJob = None
-        self.reconPoll.stop()
-        if "error" in holder:
-            self.log(f"Fast slice reconstruction failed: {holder['error']}")
-            return
-        row, self.originalSlice, corrected = holder["result"]
-        if request != self.reconRequest:
-            return  # settings changed meanwhile; the newer request is already waiting
-        original = self.originalSlice[1]
+        self.reconStep.stop()
+        if "original" in results and "corrected" in results:
+            self._showSlice(row, results["original"], results["corrected"])
+
+    def _showSlice(self, row, original, corrected):
         vmax = float(original.max()) or float(corrected.max()) or 1.0
         for kind, image in (("original", original), ("corrected", corrected)):
             view = self.views[(kind, "axial")]
@@ -513,8 +524,7 @@ class MotionCorrectionWindow:
         finally:
             self.cineTimer.stop()
             self.reconTimer.stop()
-            self.reconPoll.stop()
-            if self.reconJob is not None:
-                self.reconJob[0].join()
+            self.reconStep.stop()
+            self.reconJob = None
             self.renderer.cleanup()
             self.plotRenderer.cleanup()

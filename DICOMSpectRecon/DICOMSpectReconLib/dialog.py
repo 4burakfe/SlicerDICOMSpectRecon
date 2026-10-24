@@ -2715,8 +2715,7 @@ class SpectReconDialog:
         self.sinoSlider.setRange(0, rows - 1)
         self.sinoSlider.setEnabled(True)
         if first:
-            rowSums = self.sinoStack.sum(axis=(0, 2))
-            self.sinoSlider.setValue(int(np.argmax(rowSums)) if rowSums.size else 0)
+            self.sinoSlider.setValue(rows // 2)   # start at the middle slice
         self.sinoSlider.blockSignals(False)
         self.projSlider.setRange(0, self.projArray.shape[0] - 1)
         self.projSlider.setEnabled(True)

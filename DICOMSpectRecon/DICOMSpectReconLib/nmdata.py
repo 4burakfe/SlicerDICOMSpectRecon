@@ -230,7 +230,7 @@ def _writeUngatedCopy(ds, vectors, keepIndices, newFrames, outPath):
         setattr(ds, key, [int(v) for v in arr[keepIndices]])
 
     for key in ("TimeSlotVector", "NumberOfTimeSlots", "TimeSlotInformationSequence",
-                "TriggerVector", "NumberOfTriggers", "RRIntervalVector", "NumberOfRRIntervals"):
+                "TriggerVector", "NumberOfTriggersInPhase", "RRIntervalVector", "NumberOfRRIntervals"):
         if key in ds:
             delattr(ds, key)
 
@@ -249,10 +249,21 @@ def _writeUngatedCopy(ds, vectors, keepIndices, newFrames, outPath):
 
     ds.NumberOfFrames = int(newFrames.shape[0])
     ds.PixelData = np.ascontiguousarray(newFrames).tobytes()
+    saveExplicitLittleEndian(ds, outPath)
+
+
+def saveExplicitLittleEndian(ds, outPath):
+    """Save as explicit VR little endian. Newer pydicom takes the encoding from the transfer syntax
+    (the is_little_endian / is_implicit_VR / write_like_original options are deprecated); older
+    versions still need them."""
+    import pydicom
     ds.file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
-    ds.is_little_endian = True
-    ds.is_implicit_VR = False
-    ds.save_as(outPath, write_like_original=False)
+    try:
+        ds.save_as(outPath, enforce_file_format=True)
+    except TypeError:   # pydicom < 3
+        ds.is_little_endian = True
+        ds.is_implicit_VR = False
+        ds.save_as(outPath, write_like_original=False)
 
 
 def writeGateFile(sourceFile, outPath, gateNumber):
