@@ -174,6 +174,7 @@ def resampleCubic(arr, size, minimum=None, maximum=None):
 
 
 LINE_COLOUR = (255, 230, 0)
+FRAME_COLOUR = (0, 255, 120)   # the projection shown, on the sinogram and linogram
 
 
 def drawLine(rgb, row, rows, colour=LINE_COLOUR):
@@ -185,6 +186,21 @@ def drawLine(rgb, row, rows, colour=LINE_COLOUR):
     half = max(3, width // 40)
     centre = width // 2
     rgb[max(0, y - 3):y + 4, max(0, centre - half):centre + half + 1] = colour
+    return rgb
+
+
+def drawFrameMarker(rgb, index, count, vertical=False, colour=FRAME_COLOUR):
+    """Marker of view index (of count) on a fitted sinogram (horizontal: views run down) or
+    linogram (vertical: views run right), in place: a dashed line, so the image stays readable."""
+    height, width = rgb.shape[0], rgb.shape[1]
+    size = width if vertical else height
+    position = int(min(size - 1, max(0, round((index + 0.5) * size / count - 0.5))))
+    length = height if vertical else width
+    dashes = (np.arange(length) // 6) % 2 == 0
+    if vertical:
+        rgb[dashes, position] = colour
+    else:
+        rgb[position, dashes] = colour
     return rgb
 
 

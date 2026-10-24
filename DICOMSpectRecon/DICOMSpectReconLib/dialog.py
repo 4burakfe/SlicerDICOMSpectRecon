@@ -305,6 +305,8 @@ class SpectReconDialog:
         self.lineSlice = None
         self._lineSync = False  # the reference line and the axial slice follow each other
         self.sinoSum = None
+        self.sinoImages = None       # (sinogram, linogram) RGB without the frame marker
+        self.projSinoRows = None     # sinogram row of every shown projection
         self.sinoMax = 1.0
         self.linoMax = 1.0
         self.gateRawImages = []      # unfiltered per-gate recons in native units (cached)
@@ -2707,6 +2709,9 @@ class SpectReconDialog:
             self.projMax = 1.0
         stack = motion.slotStack(frames, raw["slots"], raw["ewv"], peakWindow)
         self.sinoStack = stack[raw["order"]]
+        position = np.empty(len(raw["order"]), dtype=int)   # slot -> row of the sinogram
+        position[np.asarray(raw["order"])] = np.arange(len(raw["order"]))
+        self.projSinoRows = position[np.asarray(raw["slots"])[sel]]
         self.sinoSum = self.sinoStack.sum(axis=1)  # summed along the axis, much less noisy than one row
         self.sinoMax = float(self.sinoSum.max()) or 1.0
         rows = self.sinoStack.shape[1]
@@ -2728,14 +2733,25 @@ class SpectReconDialog:
             self.startProjCine()
 
     def _sinoImage(self, image, vmax, lineRow=None, rows=None):
-        """PET-coloured sinogram / linogram stretched to the square panel (aspect not kept), with the
-        reference line when given."""
+        """PET-coloured sinogram / linogram (RGB) stretched to the square panel (aspect not kept), with
+        the reference line when given."""
         lower, upper = self.windows["sino"]
         fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
         rgb = display.colorize(fitted, vmax, self._petColors(), upper, lower)
         if lineRow is not None:
             rgb = display.drawLine(rgb.copy(), lineRow, rows)
-        return self.renderer.toPixmap(rgb)
+        return rgb
+
+    def _showFrameMarkers(self):
+        """The projection shown, as a line on the sinogram (across) and the linogram (up and down)."""
+        if self.sinoImages is None or self.projArray is None or self.projSinoRows is None:
+            return
+        index = min(self.projSlider.value, len(self.projSinoRows) - 1)
+        row, count = int(self.projSinoRows[index]), self.sinoStack.shape[0]
+        sino, lino = self.sinoImages
+        self.sinoView.setPixmap(self.renderer.toPixmap(display.drawFrameMarker(sino.copy(), row, count)))
+        self.linoView.setPixmap(self.renderer.toPixmap(display.drawFrameMarker(lino.copy(), row, count,
+                                                                               vertical=True)))
 
     def updateSinoViews(self, row):
         if self.sinoStack is None or not self.sinoStack.size:
@@ -2744,11 +2760,12 @@ class SpectReconDialog:
         nAngles = self.sinoStack.shape[0]
         summed = ", gates summed" if self.projGates is not None else ""
         corrected = ", motion corrected" if self.motion is not None else ""
-        self.sinoView.setPixmap(self._sinoImage(self.sinoSum, self.sinoMax))
         self.sinoInfo.setText(f"All {self.sinoStack.shape[1]} rows summed   |   {nAngles} angles, "
                               f"first at the top{summed}{corrected}")
-        self.linoView.setPixmap(self._sinoImage(self.sinoStack.sum(axis=2).T, self.linoMax,
-                                                lineRow=row, rows=self.sinoStack.shape[1]))
+        self.sinoImages = (self._sinoImage(self.sinoSum, self.sinoMax),
+                           self._sinoImage(self.sinoStack.sum(axis=2).T, self.linoMax,
+                                           lineRow=row, rows=self.sinoStack.shape[1]))
+        self._showFrameMarkers()
         self.linoInfo.setText(f"{nAngles} angles left to right, axial row 1 at the top{summed}{corrected}")
 
     def updateProjView(self, index):
@@ -2760,6 +2777,7 @@ class SpectReconDialog:
         if self.sinoSlider.isEnabled() and row < self.projArray.shape[1]:
             display.drawLine(rgb, row, self.projArray.shape[1])
         self.projView.setPixmap(self.renderer.toPixmap(rgb))
+        self._showFrameMarkers()
         text = f"Projection {index + 1} / {self.projArray.shape[0]}"
         if self.projDetectors is not None:
             text += f"   |   Detector {int(self.projDetectors[index])}"

@@ -77,6 +77,7 @@ class MotionCorrectionWindow:
         self.corrected = None
         self.sliceRecon = None        # motion.SliceReconstructor, made on first use
         self.originalSlice = None     # (row, image) of the uncorrected slice
+        self.sinoImages = {}          # (kind, "sinogram" / "linogram") -> RGB without the frame marker
         self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
         self.plotRenderer = display.PixmapRenderer(PLOT_WIDTH)
@@ -390,12 +391,19 @@ class MotionCorrectionWindow:
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
-    def _colour(self, image, vmax, lineRow=None, rows=None):
+    def _colour(self, image, vmax, lineRow=None, rows=None, asArray=False):
         """PET-coloured, stretched to the square view (aspect not kept), with the reference line if given."""
         rgb = display.colorize(_fitTo(image, VIEW_SIZE), vmax or 1.0, self.petColors, 1.0)
         if lineRow is not None:
             display.drawLine(rgb, lineRow, rows)
-        return self.renderer.toPixmap(rgb)
+        return rgb if asArray else self.renderer.toPixmap(rgb)
+
+    def _showFrameMarkers(self):
+        """The projection shown, as a line on the sinograms (across) and linograms (up and down)."""
+        index, count = min(self.projSlider.value, self.stack.shape[0] - 1), self.stack.shape[0]
+        for (kind, image), rgb in self.sinoImages.items():
+            marked = display.drawFrameMarker(rgb.copy(), index, count, vertical=image == "linogram")
+            self.views[(kind, image)].setPixmap(self.renderer.toPixmap(marked))
 
     def _refreshImages(self):
         row = self.rowSlider.value
@@ -406,8 +414,8 @@ class MotionCorrectionWindow:
         sinoMax = float(original.sum(axis=1).max())
         linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
-            self.views[(kind, "sinogram")].setPixmap(self._colour(data.sum(axis=1), sinoMax))
-            self.views[(kind, "linogram")].setPixmap(self._colour(data.sum(axis=2).T, linoMax, row, rows))
+            self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, asArray=True)
+            self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, row, rows, asArray=True)
         self._refreshProjections()
         self._scheduleRecon()
 
@@ -504,6 +512,7 @@ class MotionCorrectionWindow:
             rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax)
             display.drawLine(rgb, row, rows)
             self.views[(kind, "projection")].setPixmap(self.renderer.toPixmap(rgb))
+        self._showFrameMarkers()
 
     def _onCineToggled(self, on):
         if on:
