@@ -77,6 +77,7 @@ class MotionCorrectionWindow:
         self.corrected = None
         self.sliceRecon = None        # motion.SliceReconstructor, made on first use
         self.originalSlice = None     # (row, image) of the uncorrected slice
+        self._showingStep = False
         self.sinoImages = {}          # (kind, "sinogram" / "linogram") -> RGB without the frame marker
         self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
@@ -119,7 +120,7 @@ class MotionCorrectionWindow:
         sliders.addWidget(self.cineCheck, 0, 0)
         self.projSlider = qt.QSlider(qt.Qt.Horizontal)
         self.projSlider.setRange(0, self.stack.shape[0] - 1)
-        self.projSlider.connect("valueChanged(int)", lambda value: self._refreshProjections())
+        self.projSlider.connect("valueChanged(int)", self._onFrameChanged)
         self.projSlider.connect("sliderPressed()", lambda: self.cineCheck.setChecked(False))
         sliders.addWidget(self.projSlider, 0, 1)
         self.projLabel = qt.QLabel("")
@@ -294,7 +295,33 @@ class MotionCorrectionWindow:
         detector = int(detectors[index - 1]) if index > 0 else int(detectors[0])
         slots = np.where((self.slotDetectors == detector) & (self.times == step))[0]
         if slots.size:
-            self.projSlider.setValue(int(np.where(self.order == slots[0])[0][0]))
+            self._showingStep = True   # the step chose the frame; the frame must not choose the step back
+            try:
+                self.projSlider.setValue(int(np.where(self.order == slots[0])[0][0]))
+            finally:
+                self._showingStep = False
+
+    def _onFrameChanged(self, index):
+        """A frame picked by hand (slider, wheel) becomes the manual step in single view mode; the
+        cine moves the slider without signals, so it leaves the step alone."""
+        self._refreshProjections()
+        if self.modeCombo.currentIndex != 0 or self._showingStep:
+            return
+        slot = int(self.order[min(index, len(self.order) - 1)])
+        step = int(self.times[slot])
+        detectorIndex = self.detectorCombo.currentIndex
+        if detectorIndex > 0:   # one detector chosen: follow the detector of the frame
+            detectorIndex = int(np.where(np.unique(self.slotDetectors) == self.slotDetectors[slot])[0][0]) + 1
+        if step == self.fromSpin.value - 1 and detectorIndex == self.detectorCombo.currentIndex:
+            return
+        for widget, value in ((self.fromSpin, step + 1), (self.detectorCombo, detectorIndex)):
+            widget.blockSignals(True)
+            if widget is self.fromSpin:
+                widget.setValue(value)
+            else:
+                widget.setCurrentIndex(value)
+            widget.blockSignals(False)
+        self._newManualBase()
 
     def _installLineDrag(self, view):
         from .dialog import LineDragFilter
