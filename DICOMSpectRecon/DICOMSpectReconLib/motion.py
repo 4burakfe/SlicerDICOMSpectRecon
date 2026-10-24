@@ -241,48 +241,132 @@ def _segmentFit(centres, theta, times, breaks):
     return sse, coefficients, segment
 
 
-def lateralCorrection(centres, angles, times, slotDetectors=None, minSegment=6, maxBreaks=3, sensitivity=25.0):
-    """Correction dx (pixels) for every slot from a sideways movement: the acquisition is split in
-    time where the centre of mass jumps to another sinusoid (binary segmentation, a split is kept
-    when it lowers the residual by more than sensitivity x the noise variance), and the views of
-    every segment are moved onto the sinusoid of the longest segment."""
+def _localStep(times, values, b, width):
+    """Fit of values around time b (width views on each side) with a straight line, and with a
+    straight line plus a step at b. Returns (residual drop from the step, step height) or None.
+    A smooth drift is taken up by the line; only a sudden jump between two views needs the step."""
+    window = (times >= b - width) & (times < b + width) & np.isfinite(values)
+    before, after = window & (times < b), window & (times >= b)
+    if before.sum() < 3 or after.sum() < 3:
+        return None
+    t = times[window] - b + 0.5
+    y = values[window]
+    line = np.stack([np.ones_like(t), t], axis=1)
+    step = np.concatenate([line, (t > 0).astype(float)[:, None]], axis=1)
+    lineFit, *_ = np.linalg.lstsq(line, y, rcond=None)
+    stepFit, *_ = np.linalg.lstsq(step, y, rcond=None)
+    sseLine = float(np.sum((y - line @ lineFit) ** 2))
+    sseStep = float(np.sum((y - step @ stepFit) ** 2))
+    return sseLine - sseStep, float(stepFit[2])
+
+
+def findLateralSteps(centres, angles, times, slotDetectors=None, width=6, maxBreaks=3, sensitivity=25.0,
+                     minJump=1.0):
+    """Times at which the patient moved sideways: the centre of mass, after the sinusoid of the
+    whole acquisition is taken out, jumps between two neighbouring views (a step that a local
+    straight line cannot explain, by more than sensitivity x the noise variance, summed over the
+    detectors, and at least minJump pixels on one detector). Returns [(time, {detector: jump})]."""
     theta = np.radians(angles)
     times = np.asarray(times, dtype=int)
     nTimes = int(times.max()) + 1
-    use = np.isfinite(centres)
-    if use.sum() < 8 or nTimes < 2 * minSegment:
-        return np.zeros(len(centres))
-    sse, coefficients, segment = _segmentFit(centres, theta, times, [])
-    # noise from the differences of neighbouring views of one detector (insensitive to the steps)
-    residual = centres - _evaluate(coefficients, theta, segment)
     detectors = np.ones(len(centres), dtype=int) if slotDetectors is None else np.asarray(slotDetectors)
+    if np.isfinite(centres).sum() < 8 or nTimes < 2 * width:
+        return []
+    _, coefficients, segment = _segmentFit(centres, theta, times, [])
+    residual = centres - _evaluate(coefficients, theta, segment)
+    series = {}
     diffs = []
     for detector in np.unique(detectors):
         idx = np.where(detectors == detector)[0]
-        values = residual[idx[np.argsort(times[idx], kind="stable")]]
-        diffs.extend(np.diff(values[np.isfinite(values)]))
-    diffs = np.asarray(diffs)
-    sigma2 = (np.median(np.abs(diffs)) * 1.4826) ** 2 / 2.0 + 1e-6
-    breaks = []
-    for _ in range(maxBreaks):
-        best = None
-        for b in range(minSegment, nTimes - minSegment + 1):
-            if any(abs(b - other) < minSegment for other in breaks):
-                continue
-            candidate = _segmentFit(centres, theta, times, breaks + [b])
-            if best is None or candidate[0] < best[1][0]:
-                best = (b, candidate)
-        if best is None or sse - best[1][0] < sensitivity * sigma2:
+        idx = idx[np.argsort(times[idx], kind="stable")]
+        series[detector] = (times[idx], residual[idx])
+        values = residual[idx]
+        diffs.extend(np.diff(values[np.isfinite(values)], n=2))   # second differences ignore drifts
+    # noise of one view; at least 0.1 px, so that counting noise free curves are not split
+    sigma2 = max((np.median(np.abs(diffs)) * 1.4826) ** 2 / 6.0 if diffs else 0.0, 0.01)
+    candidates = []
+    for b in range(width, nTimes - width + 1):
+        drop, jumps = 0.0, {}
+        for detector, (t, values) in series.items():
+            fit = _localStep(t, values, b, width)
+            if fit is not None:
+                drop += fit[0]
+                jumps[detector] = fit[1]
+        if jumps and drop > sensitivity * sigma2 and max(abs(j) for j in jumps.values()) >= minJump:
+            candidates.append((drop, b, jumps))
+    steps = []
+    for drop, b, jumps in sorted(candidates, key=lambda c: -c[0]):
+        if len(steps) == maxBreaks:
             break
-        breaks.append(best[0])
-        sse, coefficients, segment = best[1]
-    if not breaks:
+        if all(abs(b - other) >= width for other, _ in steps):
+            steps.append((b, jumps))
+    return sorted(steps, key=lambda step: step[0])
+
+
+def lateralCorrection(centres, angles, times, slotDetectors=None, minSegment=6, maxBreaks=3, sensitivity=25.0,
+                      minJump=1.0):
+    """Correction dx (pixels) for every slot from sideways movements found by findLateralSteps. A
+    move of the patient by (u, v) in the axial plane moves the centre of mass of the view at angle
+    theta by u cos(theta) + v sin(theta), from that time on. With two or more detectors (u, v) is
+    solved from the jumps the detectors saw at the same moment; with one detector, the jump gives the
+    movement along the view and the later views the movement across it. The views are moved back to
+    the longest segment."""
+    theta = np.radians(angles)
+    times = np.asarray(times, dtype=int)
+    detectors = np.ones(len(centres), dtype=int) if slotDetectors is None else np.asarray(slotDetectors)
+    steps = findLateralSteps(centres, angles, times, detectors, minSegment, maxBreaks, sensitivity, minJump)
+    if not steps:
         return np.zeros(len(centres))
-    counts = np.bincount(segment)
-    reference = int(np.argmax(counts))
-    A, B = coefficients[2 * reference], coefficients[2 * reference + 1]
-    target = A * np.cos(theta) + B * np.sin(theta) + coefficients[-1]
-    return target - _evaluate(coefficients, theta, segment)
+    moves = []   # (u, v) of every step; None where only one view direction saw it
+    directions = []
+    for b, jumps in steps:
+        rows, heights = [], []
+        for detector, jump in jumps.items():
+            at = np.where((detectors == detector) & (times >= b - 1) & (times <= b))[0]
+            if at.size:
+                angle = np.angle(np.mean(np.exp(1j * theta[at])))   # between the two views
+                rows.append((np.cos(angle), np.sin(angle)))
+                heights.append(jump)
+        rows = np.array(rows)
+        if len(rows) >= 2 and np.linalg.matrix_rank(rows, tol=0.2) == 2:
+            (u, v), *_ = np.linalg.lstsq(rows, np.array(heights), rcond=None)
+            moves.append((u, v))
+        else:
+            moves.append(None)
+        directions.append((float(np.arctan2(*rows[0][::-1])) if len(rows) else 0.0,
+                           float(heights[0]) if heights else 0.0))
+    if any(move is None for move in moves):
+        # one view direction only: the jump gives the movement along it; the movement across it
+        # shows up in the later views and is fitted together with one sinusoid for all views
+        columns = [np.cos(theta), np.sin(theta), np.ones(len(theta))]
+        target = np.asarray(centres, dtype=float).copy()
+        unknown = []
+        for k, ((b, _), move) in enumerate(zip(steps, moves)):
+            after = (times >= b).astype(float)
+            if move is None:
+                angle, jump = directions[k]
+                target -= after * jump * np.cos(theta - angle)
+                columns.append(after * np.sin(theta - angle))
+                unknown.append(k)
+            else:
+                target -= after * (move[0] * np.cos(theta) + move[1] * np.sin(theta))
+        design = np.stack(columns, axis=1)
+        use = np.isfinite(target)
+        fit, *_ = np.linalg.lstsq(design[use], target[use], rcond=None)
+        for j, k in enumerate(unknown):
+            angle, jump = directions[k]
+            across = fit[3 + j]
+            moves[k] = (jump * np.cos(angle) - across * np.sin(angle), jump * np.sin(angle) + across * np.cos(angle))
+    segment = np.searchsorted([b for b, _ in steps], times, side="right")
+    # every view goes back to where it would have been during the longest segment
+    reference = int(np.argmax(np.bincount(segment, minlength=len(steps) + 1)))
+    correction = np.zeros(len(centres))
+    for k, ((b, _), (u, v)) in enumerate(zip(steps, moves)):
+        moved = u * np.cos(theta) + v * np.sin(theta)
+        correction -= (times >= b) * moved
+        if k < reference:
+            correction += moved
+    return correction
 
 
 def _evaluate(coefficients, theta, segment):
