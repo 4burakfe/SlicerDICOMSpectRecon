@@ -48,10 +48,12 @@ Author: Burak Demir, MD, FEBNM
   recovery; computed one row at a time between window events after 1 s without changes), the projections (in cine), the
   summed sinogram and the linogram on the top row and the motion corrected ones below, with a plot of
   the shift of every view. *Detect* finds axial (up/down) movement by cross-correlating every view's
-  axial count profile with the median profile [2], and sideways movement from the transaxial centre of
-  mass of the views [3], which follows a sinusoid over the angles until the patient moves (the
-  acquisition is split in time where it jumps to another sinusoid, and the views are moved back onto
-  the longest one); the views are shifted before reconstruction, as in [3]. See [4] for a comparison of
+  axial count profile with the median profile [2]. Sideways movement (off by default) is found from
+  the transaxial centre of mass of the views [3]: after the sinusoid of the whole acquisition is taken
+  out, only a sudden jump between two neighbouring views counts as a move, since attenuation and
+  activity entering the field of view bend the curve smoothly; the move is solved from the jumps the
+  detectors saw at the same moment and the views are moved back to the longest still period. The
+  views are shifted before reconstruction, as in [3]. See [4] for a comparison of
   such detection methods. The detection and correction were written for this extension; they are not
   a copy of a published or vendor implementation. Shifts can also be added by hand to a single time
   step (the default) or a range of steps, on all detectors or one, and are applied live; changing a

@@ -183,7 +183,9 @@ class MotionCorrectionWindow:
         self.axialCheck = qt.QCheckBox("Axial (up/down, linogram)")
         self.axialCheck.setChecked(True)
         self.lateralCheck = qt.QCheckBox("Lateral (sideways, centre of mass)")
-        self.lateralCheck.setChecked(True)
+        self.lateralCheck.setChecked(False)   # off by default: attenuation bends the centre of mass curve
+        self.lateralCheck.setToolTip("Sudden sideways jumps of the centre of mass between two views; smooth "
+                                     "changes (attenuation, activity entering the field of view) are left alone")
         self.thresholdSpin = self._doubleSpin(0.0, 5.0, 0.1, motion.DEFAULT_THRESHOLD, " px",
                                               "Shifts smaller than this are left alone")
         self.smoothingSpin = qt.QSpinBox()
