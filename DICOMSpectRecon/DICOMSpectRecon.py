@@ -285,6 +285,8 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
         suffix = "AC" if info.get("AttenuationCorrection") == "CT" else "NC"
         if info.get("ScatterCorrection", "None") != "None":
             suffix += " SC"
+        if info.get("ResolutionRecovery", "None") not in ("None", "", None):
+            suffix += " RR"
         units = info.get("Units", "counts")
         unitSuffix = {"Bq/ml": " Bqml", "SUVbw": " SUVbw", "SUL": " SUL"}.get(units, "")
         baseName = loadable.name
