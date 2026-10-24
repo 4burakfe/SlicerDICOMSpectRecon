@@ -13,6 +13,7 @@ PLOT_HEIGHT = 170
 PLOT_WIDTH = 4 * VIEW_SIZE + 30
 RECON_DELAY_MS = 1000         # the slice is reconstructed after 1 s without changes
 CINE_INTERVAL_MS = 120
+DEFAULT_WINDOWS = {"axial": (0.0, 1.0), "proj": (0.0, 1.0), "sino": (0.0, 1.0)}
 DX_COLOUR = (255, 150, 40)    # lateral
 DZ_COLOUR = (60, 200, 255)    # axial
 
@@ -78,6 +79,9 @@ class MotionCorrectionWindow:
         self.sliceRecon = None        # motion.SliceReconstructor, made on first use
         self.originalSlice = None     # (row, image) of the uncorrected slice
         self._showingStep = False
+        # display windows (lower, upper fraction of the maximum), changed with the middle mouse button
+        self.windows = dict(DEFAULT_WINDOWS)
+        self.shownSlice = None        # (row, original, corrected) of the axial slices on display
         self.sinoImages = {}          # (kind, "sinogram" / "linogram") -> RGB without the frame marker
         self.petColors = display.petColorTable()
         self.renderer = display.PixmapRenderer(VIEW_SIZE)
@@ -142,7 +146,8 @@ class MotionCorrectionWindow:
                             f"({self.reconDescription()}), original and corrected on the same scale. "
                             "The sinogram is all rows summed along the axis, views along the rotation from "
                             "the top; the linogram has the views left to right and axial row 1 at the top. "
-                            "Photopeak window, gates summed.")
+                            "Photopeak window, gates summed. Middle mouse button on a view: drag left/right "
+                            "for the window width, up/down for the level; double-click to reset.")
         caption.setWordWrap(True)
         caption.setStyleSheet("color: gray;")
         views.addWidget(caption, 4, 1, 1, 4)
@@ -157,7 +162,11 @@ class MotionCorrectionWindow:
 
         self.lineFilters = []
         self.wheelFilters = []
+        self.windowFilters = []
         for kind in ("original", "corrected"):
+            for image, group in (("axial", "axial"), ("projection", "proj"), ("sinogram", "sino"),
+                                 ("linogram", "sino")):
+                self._installWindowDrag(self.views[(kind, image)], group)
             self._installLineDrag(self.views[(kind, "projection")])
             self._installWheel(self.views[(kind, "projection")], self.projSlider, stopsCine=True)
             # wheel up = next slice up (superior), as in the main window: one row up the projection
@@ -323,6 +332,45 @@ class MotionCorrectionWindow:
             widget.blockSignals(False)
         self._newManualBase()
 
+    def _installWindowDrag(self, view, group):
+        """Middle mouse button: drag left/right for the window width, up/down for the level (as in the
+        main window); double-click to reset. Both rows of a column share one window."""
+        from .dialog import WindowDragFilter
+        state = {}
+
+        def start():
+            state["window"] = self.windows[group]
+
+        def drag(dx, dy):
+            if "window" not in state:
+                return
+            lower, upper = state["window"]
+            centre, width = (lower + upper) / 2.0, upper - lower
+            width = max(0.01, width + dx / float(VIEW_SIZE))
+            centre = centre - dy / float(VIEW_SIZE)
+            self.windows[group] = (centre - width / 2.0, centre + width / 2.0)
+            self._redrawWindowGroup(group)
+
+        def reset():
+            self.windows[group] = DEFAULT_WINDOWS[group]
+            self._redrawWindowGroup(group)
+        try:
+            windowFilter = WindowDragFilter(start, drag, reset)
+            view.installEventFilter(windowFilter)
+            self.windowFilters.append(windowFilter)  # keep alive
+        except Exception:
+            self.log("Window adjustment not available")
+
+    def _redrawWindowGroup(self, group):
+        if group == "axial":
+            if self.shownSlice is not None:
+                self._showSlice(*self.shownSlice)
+        elif group == "proj":
+            self._refreshProjections()
+        else:
+            self._renderSinograms()
+            self._showFrameMarkers()
+
     def _installLineDrag(self, view):
         from .dialog import LineDragFilter
         rows = self.stack.shape[1]
@@ -422,11 +470,12 @@ class MotionCorrectionWindow:
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
-    def _colour(self, image, vmax, lineRow=None, rows=None, asArray=False, nearest=False):
-        """PET-coloured, stretched to the square view (aspect not kept), with the reference line if given;
-        nearest neighbour (sinograms, linograms) or bicubic (axial slice)."""
+    def _colour(self, image, vmax, group, lineRow=None, rows=None, asArray=False, nearest=False):
+        """PET-coloured in the display window of group, stretched to the square view (aspect not kept),
+        with the reference line if given; nearest neighbour (sinograms, linograms) or bicubic (axial)."""
         fitted = display.resampleNearestTo(image, VIEW_SIZE, VIEW_SIZE) if nearest else _fitTo(image, VIEW_SIZE)
-        rgb = display.colorize(fitted, vmax or 1.0, self.petColors, 1.0)
+        lower, upper = self.windows[group]
+        rgb = display.colorize(fitted, vmax or 1.0, self.petColors, upper, lower)
         if lineRow is not None:
             display.drawLine(rgb, lineRow, rows)
         return rgb if asArray else self.renderer.toPixmap(rgb)
@@ -439,20 +488,24 @@ class MotionCorrectionWindow:
             self.views[(kind, image)].setPixmap(self.renderer.toPixmap(marked))
 
     def _refreshImages(self):
+        self.rowLabel.setText(f"{self.rowSlider.value + 1} / {self.stack.shape[1]}")
+        self._renderSinograms()
+        self._refreshProjections()
+        self._scheduleRecon()
+
+    def _renderSinograms(self):
+        """Sinograms and linograms (without the frame marker) into sinoImages."""
         row = self.rowSlider.value
-        self.rowLabel.setText(f"{row + 1} / {self.stack.shape[1]}")
         original, corrected = self.stack[self.order], self.corrected[self.order]
         rows = self.stack.shape[1]
         line = original[:, row, :]  # the reference line on every projection sets the display maxima
         sinoMax = float(original.sum(axis=1).max())
         linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
-            self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, asArray=True,
-                                                               nearest=True)
-            self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, row, rows,
+            self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, "sino",
                                                                asArray=True, nearest=True)
-        self._refreshProjections()
-        self._scheduleRecon()
+            self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, "sino", row, rows,
+                                                               asArray=True, nearest=True)
 
     # ---------------- fast axial slice ----------------
     def _scheduleRecon(self):
@@ -517,10 +570,11 @@ class MotionCorrectionWindow:
             self._showSlice(row, results["original"], results["corrected"])
 
     def _showSlice(self, row, original, corrected):
+        self.shownSlice = (row, original, corrected)
         vmax = float(original.max()) or float(corrected.max()) or 1.0
         for kind, image in (("original", original), ("corrected", corrected)):
             view = self.views[(kind, "axial")]
-            view.setPixmap(self._colour(image, vmax))
+            view.setPixmap(self._colour(image, vmax, "axial"))
             view.setToolTip(f"Axial slice at line {row + 1}: {self.reconDescription()}")
 
     def reconDescription(self):
@@ -544,7 +598,8 @@ class MotionCorrectionWindow:
         row, rows = self.rowSlider.value, self.stack.shape[1]
         projMax = float(self.stack[:, row, :].max()) or float(self.stack.max()) or 1.0
         for kind, data in (("original", self.stack), ("corrected", self.corrected)):
-            rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax)
+            rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax, self.windows["proj"][1],
+                                    self.windows["proj"][0])
             display.drawLine(rgb, row, rows)
             self.views[(kind, "projection")].setPixmap(self.renderer.toPixmap(rgb))
         self._showFrameMarkers()
