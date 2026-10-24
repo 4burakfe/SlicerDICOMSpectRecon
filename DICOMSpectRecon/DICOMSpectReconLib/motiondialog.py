@@ -159,7 +159,9 @@ class MotionCorrectionWindow:
         for kind in ("original", "corrected"):
             self._installLineDrag(self.views[(kind, "projection")])
             self._installWheel(self.views[(kind, "projection")], self.projSlider, stopsCine=True)
-            for image in ("axial", "sinogram", "linogram"):
+            # wheel up = next slice up (superior), as in the main window: one row up the projection
+            self._installWheel(self.views[(kind, "axial")], self.rowSlider, reverse=True)
+            for image in ("sinogram", "linogram"):
                 self._installWheel(self.views[(kind, image)], self.rowSlider)
 
         self.reconTimer = qt.QTimer()
@@ -268,12 +270,14 @@ class MotionCorrectionWindow:
         buttons.addWidget(cancelButton)
         side.addLayout(buttons)
 
-    def _installWheel(self, view, slider, stopsCine=False):
+    def _installWheel(self, view, slider, stopsCine=False, reverse=False):
         from .dialog import WheelScrollFilter
 
         def step(direction):
             if stopsCine:
                 self.cineCheck.setChecked(False)
+            if reverse:
+                direction = -direction
             slider.setValue(max(slider.minimum, min(slider.maximum, slider.value + direction)))
         try:
             wheelFilter = WheelScrollFilter(step)
