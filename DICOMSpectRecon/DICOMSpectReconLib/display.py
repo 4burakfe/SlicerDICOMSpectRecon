@@ -158,6 +158,15 @@ def resampleCubicTo(arr, height, width, minimum=None, maximum=None):
     return out.astype(np.float32)
 
 
+def resampleNearestTo(arr, height, width):
+    """Scalar array stretched to exactly height x width by repeating the nearest pixel, so every
+    view and row of a sinogram or linogram stays a sharp block."""
+    arr = np.asarray(arr, dtype=np.float32)
+    rows = np.minimum((np.arange(height) + 0.5) * arr.shape[0] / height, arr.shape[0] - 1).astype(int)
+    cols = np.minimum((np.arange(width) + 0.5) * arr.shape[1] / width, arr.shape[1] - 1).astype(int)
+    return arr[rows][:, cols]
+
+
 def resampleCubic(arr, size, minimum=None, maximum=None):
     """Scalar slice resampled to fit size x size with bicubic interpolation, so the preview is
     interpolated in the data and only then coloured (Qt's smooth scaling would blend the colours).
