@@ -35,6 +35,9 @@ WINDOW_HINT = ("Middle mouse button on a preview: drag left/right for the window
 RR_AUTO = "Auto"
 RR_OSEM_FACTOR = 2    # OSEM iterations x this with resolution recovery (slower convergence with the PSF)
 RR_BSREM_FACTOR = 2
+# Butterworth cutoff (cycles/cm) the post-filter starts from, by algorithm: (static, gated). BSREM's prior
+# already controls the noise, so it gets a sharper filter.
+DEFAULT_CUTOFFS = {"OSEM": (0.45, 0.35), "BSREM": (0.6, 0.4)}
 DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
 
@@ -662,6 +665,7 @@ class SpectReconDialog:
         reconForm.setRowStretch(15, 1)
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateRrNote())
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateAlgorithmRows())
+        self.rrCheckBox.connect("toggled(bool)", lambda checked: self._applyRrFilters())
         for spin in (self.rrOsemFactorSpin, self.rrBsremFactorSpin):
             spin.connect("valueChanged(int)", lambda value: self._updateRrNote())
         self.rrCombo.connect("currentIndexChanged(int)", lambda index: self._updateRrNote())
@@ -754,6 +758,8 @@ class SpectReconDialog:
             self.onGatedFilterChanged(self.gatedFilterCombo.currentIndex)
 
         self.postFilterBeforeFbp = None
+        self.postFilterBeforeRr = None    # filters to put back when resolution recovery is switched off
+        self.algorithmBefore = self.algorithmCombo.currentText
         self.algorithmCombo.connect("currentIndexChanged(int)", self.onAlgorithmChanged)
         self._updateAlgorithmRows()
 
@@ -1836,11 +1842,46 @@ class SpectReconDialog:
         self.gatedOrderSpin.setEnabled(name == "Butterworth")
         self.gatedCutoffNyquistLabel.setEnabled(name in ("Butterworth", "Hann"))
 
+    def _postFilterCombos(self):
+        return [self.filterCombo] + ([self.gatedFilterCombo] if self.isGated else [])
+
+    def _applyRrFilters(self):
+        """Resolution recovery already shapes the resolution, so the post-filters are switched off while it
+        is on (OSEM and BSREM, static and gated) and put back when it is switched off."""
+        rrOn = self.rrCheckBox.checked and self.algorithmCombo.currentText in ITERATIVE_ALGORITHMS
+        combos = self._postFilterCombos()
+        if rrOn and self.postFilterBeforeRr is None:
+            self.postFilterBeforeRr = [combo.currentIndex for combo in combos]
+            for combo in combos:
+                combo.setCurrentIndex(combo.findText("None"))
+        elif not rrOn and self.postFilterBeforeRr is not None:
+            for combo, previous in zip(combos, self.postFilterBeforeRr):
+                if combo.currentText == "None":  # leave a filter the user picked alone
+                    combo.setCurrentIndex(previous)
+            self.postFilterBeforeRr = None
+
+    def _applyAlgorithmCutoffs(self):
+        """Switching between OSEM and BSREM moves the Butterworth cutoffs to the new algorithm's defaults,
+        unless they were changed by hand (also across a detour through FBP)."""
+        before, after = self.algorithmBefore, self.algorithmCombo.currentText
+        if after not in DEFAULT_CUTOFFS:   # FBP: remember the last iterative algorithm
+            return
+        self.algorithmBefore = after
+        if before not in DEFAULT_CUTOFFS or before == after:
+            return
+        spins = [self.cutoffSpin] + ([self.gatedCutoffSpin] if self.isGated else [])
+        for spin, old, new in zip(spins, DEFAULT_CUTOFFS[before], DEFAULT_CUTOFFS[after]):
+            if abs(spin.value - old) < 1e-6:
+                spin.value = new
+
     def onAlgorithmChanged(self, index):
         """FBP smooths with its own window, so the post-filters are switched off for it (and put back
         when leaving FBP). OSEM and BSREM keep them."""
         fbp = self.algorithmCombo.currentText == ALGORITHM_FBP
-        combos = [self.filterCombo] + ([self.gatedFilterCombo] if self.isGated else [])
+        combos = self._postFilterCombos()
+        if fbp and self.postFilterBeforeRr is not None:   # the filters before RR are the ones to restore
+            self.postFilterBeforeFbp = self.postFilterBeforeRr
+            self.postFilterBeforeRr = None
         if fbp and self.postFilterBeforeFbp is None:
             self.postFilterBeforeFbp = [combo.currentIndex for combo in combos]
             for combo in combos:
@@ -1850,6 +1891,8 @@ class SpectReconDialog:
                 if combo.currentText == "None":  # leave a filter the user picked alone
                     combo.setCurrentIndex(previous)
             self.postFilterBeforeFbp = None
+        self._applyAlgorithmCutoffs()
+        self._applyRrFilters()
         self._updateAlgorithmRows()
 
     def _updateAlgorithmRows(self):
@@ -2082,10 +2125,13 @@ class SpectReconDialog:
             return 1
         return int(params.get("rrFactor", {}).get(params["algorithm"], 1) or 1)
 
-    @staticmethod
-    def bsremParams(params, gated=False):
-        """BSREM settings of the static image, or of the gates (their own beta and gamma)."""
+    @classmethod
+    def bsremParams(cls, params, gated=False):
+        """BSREM settings of the static image, or of the gates (their own beta and gamma). With resolution
+        recovery the relaxation and the OSEM start are stretched by the RR iteration factor, since the
+        PSF model needs that many more effective iterations."""
         bsrem = dict(params["bsrem"])
+        bsrem["rrScale"] = cls.rrIterationFactor(params)
         if gated and params.get("gatedBeta") is not None:
             bsrem["beta"] = params["gatedBeta"]
         if gated and params.get("gatedGamma") is not None:

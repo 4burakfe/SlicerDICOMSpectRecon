@@ -526,7 +526,11 @@ class SpectReconLogic:
         if subsets > 1 and nViews % subsets != 0:
             self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
         likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections, additive_term=additive_term)
-        warm = BSREM_WARM_START_ITERATIONS
+        # With resolution recovery convergence is slower: the decreasing relaxation would stop the image
+        # before the PSF has sharpened it, so the start and the relaxation are stretched by the RR factor.
+        scale = max(1, int(bsrem.get("rrScale", 1) or 1))
+        warm = BSREM_WARM_START_ITERATIONS * scale
+        relaxationIterations = BSREM_RELAXATION_ITERATIONS * scale
         total = (warm + iters) * subsets
         self.log(f"  -> Starting image: {warm} OSEM iteration(s) x {subsets} subsets")
         monitor = _OsemMonitor(f"{projectionSet.label} (OSEM start)", warm, subsets,
@@ -534,7 +538,7 @@ class SpectReconLogic:
         initial = OSEM(likelihood)(n_iters=warm, n_subsets=subsets, callback=monitor)
         prior = RelativeDifferencePrior(beta=beta, gamma=gamma) if beta > 0 else None
         algorithm = BSREM(likelihood, object_initial=initial.clone(), prior=prior,
-                          relaxation_sequence=lambda n: 1.0 / (1.0 + n / BSREM_RELAXATION_ITERATIONS))
+                          relaxation_sequence=lambda n: 1.0 / (1.0 + n / relaxationIterations))
         monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort,
                                done=warm * subsets, total=total)
         image = algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
