@@ -26,7 +26,8 @@ Author: Burak Demir, MD, FEBNM
   with a relative difference prior: OSEM-like subset updates with a decreasing step, started from one
   OSEM iteration, so it converges and the prior strength beta, not the iteration count, sets the noise
   level. Defaults: 4 iterations, beta 0.2 and gamma 2 for the static image, beta 0.4 and gamma 2 for the
-  gates, with the Butterworth post-filter left on.
+  gates, with the Butterworth post-filter left on (cutoff 0.6 cycles/cm static, 0.4 gated; switching
+  between OSEM and BSREM moves the cutoffs between their defaults unless they were changed by hand).
 - **FBP** (filtered backprojection) as an alternative: ramp filter with a Ramp, Shepp-Logan, Cosine,
   Hamming, Hann or Butterworth window and a cutoff in cycles/cm (applied in 2D on the projections, like
   camera software). Scatter is subtracted from the projections and attenuation is corrected with the
@@ -41,7 +42,10 @@ Author: Burak Demir, MD, FEBNM
   PyTomography. It raises contrast
   recovery of small hot spots and needs more iterations to converge; edge ringing (Gibbs) comes with it.
   While it is on, the iterations are multiplied by an "RR iterations" factor (x2 for OSEM, static and
-  gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored.
+  gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored. For
+  BSREM the OSEM start and the decreasing step are stretched by the same factor, since the step would
+  otherwise shrink before the PSF has sharpened the image. The post-filters are switched off while
+  resolution recovery is on and put back when it is switched off.
 - **Motion correction** (orange *Motion correction...* button): a separate window shows a fast
   reconstruction of the axial slice at the yellow line (2D, with the main window's algorithm,
   iterations, subsets, prior or FBP window and post-filter, without attenuation, scatter or resolution
