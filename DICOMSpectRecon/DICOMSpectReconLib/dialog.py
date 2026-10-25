@@ -38,6 +38,9 @@ RR_BSREM_FACTOR = 2
 # Butterworth cutoff (cycles/cm) the post-filter starts from, by algorithm: (static, gated). BSREM's prior
 # already controls the noise, so it gets a sharper filter.
 DEFAULT_CUTOFFS = {"OSEM": (0.45, 0.35), "BSREM": (0.6, 0.4)}
+# BSREM prior strength (static, gated) without and with resolution recovery: with the PSF in the model the
+# prior suppresses the recovered resolution, so the static image goes unregularised by default.
+DEFAULT_BETAS = {False: (0.2, 0.4), True: (0.0, 0.2)}
 DEFAULTS_SETTINGS_KEY = "SPECTRecon/DialogDefaults"  # JSON of the saved side panel settings
 FWHM_TOOLTIP = "Gaussian full width at half maximum (FWHM = 2.355 x sigma)"
 
@@ -666,6 +669,7 @@ class SpectReconDialog:
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateRrNote())
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateAlgorithmRows())
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._applyRrFilters())
+        self.rrCheckBox.connect("toggled(bool)", lambda checked: self._applyRrBetas())
         for spin in (self.rrOsemFactorSpin, self.rrBsremFactorSpin):
             spin.connect("valueChanged(int)", lambda value: self._updateRrNote())
         self.rrCombo.connect("currentIndexChanged(int)", lambda index: self._updateRrNote())
@@ -759,6 +763,7 @@ class SpectReconDialog:
 
         self.postFilterBeforeFbp = None
         self.postFilterBeforeRr = None    # filters to put back when resolution recovery is switched off
+        self.rrBetas = False                # the BSREM betas are at their resolution recovery defaults
         self.algorithmBefore = self.algorithmCombo.currentText
         self.algorithmCombo.connect("currentIndexChanged(int)", self.onAlgorithmChanged)
         self._updateAlgorithmRows()
@@ -1860,6 +1865,18 @@ class SpectReconDialog:
                     combo.setCurrentIndex(previous)
             self.postFilterBeforeRr = None
 
+    def _applyRrBetas(self):
+        """BSREM with resolution recovery: the betas move to their RR defaults (static 0, gated 0.2) and back
+        when RR or BSREM is left, unless they were changed by hand."""
+        rrBsrem = self.rrCheckBox.checked and self.algorithmCombo.currentText == ALGORITHM_BSREM
+        if rrBsrem == self.rrBetas:
+            return
+        spins = [self.bsremBetaSpin] + ([self.gatedBetaSpin] if self.isGated else [])
+        for spin, old, new in zip(spins, DEFAULT_BETAS[self.rrBetas], DEFAULT_BETAS[rrBsrem]):
+            if abs(spin.value - old) < 1e-6:
+                spin.value = new
+        self.rrBetas = rrBsrem
+
     def _applyAlgorithmCutoffs(self):
         """Switching between OSEM and BSREM moves the Butterworth cutoffs to the new algorithm's defaults,
         unless they were changed by hand (also across a detour through FBP)."""
@@ -1893,6 +1910,7 @@ class SpectReconDialog:
             self.postFilterBeforeFbp = None
         self._applyAlgorithmCutoffs()
         self._applyRrFilters()
+        self._applyRrBetas()
         self._updateAlgorithmRows()
 
     def _updateAlgorithmRows(self):
