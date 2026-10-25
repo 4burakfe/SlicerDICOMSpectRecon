@@ -45,7 +45,8 @@ Author: Burak Demir, MD, FEBNM
   gated; x2 for BSREM) without changing the iteration boxes; the real count is logged and stored. For
   BSREM the OSEM start and the decreasing step are stretched by the same factor, since the step would
   otherwise shrink before the PSF has sharpened the image. The post-filters are switched off while
-  resolution recovery is on and put back when it is switched off.
+  resolution recovery is on and put back when it is switched off. With BSREM the betas then default to 0 (static)
+  and 0.2 (gated), since the prior would otherwise suppress the recovered resolution.
 - **Motion correction** (orange *Motion correction...* button): a separate window shows a fast
   reconstruction of the axial slice at the yellow line (2D, with the main window's algorithm,
   iterations, subsets, prior or FBP window and post-filter, without attenuation, scatter or resolution
