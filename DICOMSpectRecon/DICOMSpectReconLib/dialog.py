@@ -683,7 +683,7 @@ class SpectReconDialog:
         self.filterCombo.addItems(["None", "Gaussian", "Butterworth", "Hann"])
         self.filterCombo.setCurrentIndex(2)  # Butterworth by default
         self.fwhmSpin = _slider(0.5, 30.0, 0.5, 1, 10.0, " mm", FWHM_TOOLTIP)
-        self.cutoffSpin = _slider(0.05, 1.5, 0.01, 2, 0.45, " cycles/cm",
+        self.cutoffSpin = _slider(0.05, 1.5, 0.01, 2, DEFAULT_CUTOFFS["OSEM"][0], " cycles/cm",
                                   "Cutoff in cycles/cm, so it smooths the same whatever the pixel size; it is "
                                   "limited to the Nyquist frequency, 1 / (2 x pixel size in cm).\n"
                                   "Butterworth: static perfusion about 0.40-0.52 cycles/cm (vendor defaults: 0.40 rest, "
@@ -732,7 +732,7 @@ class SpectReconDialog:
             self.gatedFilterCombo.setCurrentIndex(2)
             self.gatedFwhmSpin = _slider(0.5, 30.0, 0.5, 1, 12.0, " mm", FWHM_TOOLTIP)
             self.gatedCutoffSpin = _slider(
-                0.05, 1.5, 0.01, 2, 0.35, " cycles/cm",
+                0.05, 1.5, 0.01, 2, DEFAULT_CUTOFFS["OSEM"][1], " cycles/cm",
                 "Gated SPECT: about 0.40 cycles/cm (vendor default). Lower cutoffs blur the end-systolic cavity "
                 "away and overestimate the EF (beating phantom: EF stable from 0.5-0.6 x Nyquist, EF 91 % instead "
                 "of 69 % at 0.2 x Nyquist; Duarte et al., J Nucl Med Technol 2012)")
