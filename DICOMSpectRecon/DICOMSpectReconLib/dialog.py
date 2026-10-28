@@ -38,6 +38,9 @@ RR_BSREM_FACTOR = 2
 # Butterworth cutoff (cycles/cm) the post-filter starts from, by algorithm: (static, gated). BSREM's prior
 # already controls the noise, so it gets a sharper filter.
 DEFAULT_CUTOFFS = {"OSEM": (0.40, 0.35), "BSREM": (0.6, 0.4)}
+# Post-filter while resolution recovery is on: Butterworth with these cutoffs (static, gated), cycles/cm
+RR_FILTER = "Butterworth"
+RR_CUTOFFS = (0.5, 0.4)
 # BSREM prior strength (static, gated) without and with resolution recovery: with the PSF in the model the
 # prior suppresses the recovered resolution, so the static image goes unregularised by default.
 DEFAULT_BETAS = {False: (0.2, 0.4), True: (0.0, 0.2)}
@@ -763,6 +766,7 @@ class SpectReconDialog:
 
         self.postFilterBeforeFbp = None
         self.postFilterBeforeRr = None    # filters to put back when resolution recovery is switched off
+        self.cutoffsBeforeRr = None       # cutoffs to put back when resolution recovery is switched off
         self.rrBetas = False                # the BSREM betas are at their resolution recovery defaults
         self.algorithmBefore = self.algorithmCombo.currentText
         self.algorithmCombo.connect("currentIndexChanged(int)", self.onAlgorithmChanged)
@@ -929,14 +933,14 @@ class SpectReconDialog:
     def _defaultsWidgets(self):
         """Side panel settings that can be saved as defaults, by key. Study specific choices (CT series,
         energy windows, quantification) are left out. The algorithm comes first: switching it changes
-        the post-filters, which are set after it."""
-        widgets = [("algorithm", self.algorithmCombo), ("iters", self.itersSpin), ("subsets", self.subsetsSpin),
+        the post-filters, which are set after it. Resolution recovery comes next for the same reason."""
+        widgets = [("algorithm", self.algorithmCombo), ("resolutionRecovery", self.rrCheckBox),
+                   ("iters", self.itersSpin), ("subsets", self.subsetsSpin),
                    ("bsremIters", self.bsremItersSpin), ("bsremBeta", self.bsremBetaSpin),
                    ("bsremGamma", self.bsremGammaSpin), ("fbpWindow", self.fbpWindowCombo),
                    ("fbpCutoff", self.fbpCutoffSpin), ("fbpOrder", self.fbpOrderSpin),
                    ("filter", self.filterCombo), ("fwhm", self.fwhmSpin), ("cutoff", self.cutoffSpin),
-                   ("order", self.orderSpin), ("resolutionRecovery", self.rrCheckBox),
-                   ("collimator", self.rrCombo), ("rrOsemFactor", self.rrOsemFactorSpin),
+                   ("order", self.orderSpin), ("collimator", self.rrCombo), ("rrOsemFactor", self.rrOsemFactorSpin),
                    ("rrBsremFactor", self.rrBsremFactorSpin), ("scaling", self.scalingCombo),
                    ("attenuationCorrection", self.acCheckBox), ("showOnCt", self.showOnCtCheckBox),
                    ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin)]
@@ -1850,20 +1854,33 @@ class SpectReconDialog:
     def _postFilterCombos(self):
         return [self.filterCombo] + ([self.gatedFilterCombo] if self.isGated else [])
 
+    def _cutoffSpins(self):
+        return [self.cutoffSpin] + ([self.gatedCutoffSpin] if self.isGated else [])
+
     def _applyRrFilters(self):
-        """Resolution recovery already shapes the resolution, so the post-filters are switched off while it
-        is on (OSEM and BSREM, static and gated) and put back when it is switched off."""
+        """While resolution recovery is on (OSEM and BSREM) the post-filters default to Butterworth with the
+        RR cutoffs (static 0.5, gated 0.4 cycles/cm); the filters and cutoffs from before are put back when
+        it is switched off, unless they were changed by hand in between."""
         rrOn = self.rrCheckBox.checked and self.algorithmCombo.currentText in ITERATIVE_ALGORITHMS
-        combos = self._postFilterCombos()
+        combos, spins = self._postFilterCombos(), self._cutoffSpins()
         if rrOn and self.postFilterBeforeRr is None:
             self.postFilterBeforeRr = [combo.currentIndex for combo in combos]
             for combo in combos:
-                combo.setCurrentIndex(combo.findText("None"))
+                combo.setCurrentIndex(combo.findText(RR_FILTER))
         elif not rrOn and self.postFilterBeforeRr is not None:
             for combo, previous in zip(combos, self.postFilterBeforeRr):
-                if combo.currentText == "None":  # leave a filter the user picked alone
+                if combo.currentText == RR_FILTER:  # leave a filter the user picked alone
                     combo.setCurrentIndex(previous)
             self.postFilterBeforeRr = None
+        if rrOn and self.cutoffsBeforeRr is None:
+            self.cutoffsBeforeRr = [spin.value for spin in spins]
+            for spin, cutoff in zip(spins, RR_CUTOFFS):
+                spin.value = cutoff
+        elif not rrOn and self.cutoffsBeforeRr is not None:
+            for spin, previous, cutoff in zip(spins, self.cutoffsBeforeRr, RR_CUTOFFS):
+                if abs(spin.value - cutoff) < 1e-6:  # leave a cutoff the user changed alone
+                    spin.value = previous
+            self.cutoffsBeforeRr = None
 
     def _applyRrBetas(self):
         """BSREM with resolution recovery: the betas move to their RR defaults (static 0, gated 0.2) and back
@@ -1886,8 +1903,12 @@ class SpectReconDialog:
         self.algorithmBefore = after
         if before not in DEFAULT_CUTOFFS or before == after:
             return
-        spins = [self.cutoffSpin] + ([self.gatedCutoffSpin] if self.isGated else [])
-        for spin, old, new in zip(spins, DEFAULT_CUTOFFS[before], DEFAULT_CUTOFFS[after]):
+        if self.cutoffsBeforeRr is not None:
+            # resolution recovery holds its own cutoffs: move the ones it puts back instead
+            self.cutoffsBeforeRr = [new if abs(value - old) < 1e-6 else value for value, old, new in
+                                    zip(self.cutoffsBeforeRr, DEFAULT_CUTOFFS[before], DEFAULT_CUTOFFS[after])]
+            return
+        for spin, old, new in zip(self._cutoffSpins(), DEFAULT_CUTOFFS[before], DEFAULT_CUTOFFS[after]):
             if abs(spin.value - old) < 1e-6:
                 spin.value = new
 
@@ -1896,11 +1917,11 @@ class SpectReconDialog:
         when leaving FBP). OSEM and BSREM keep them."""
         fbp = self.algorithmCombo.currentText == ALGORITHM_FBP
         combos = self._postFilterCombos()
-        if fbp and self.postFilterBeforeRr is not None:   # the filters before RR are the ones to restore
-            self.postFilterBeforeFbp = self.postFilterBeforeRr
-            self.postFilterBeforeRr = None
         if fbp and self.postFilterBeforeFbp is None:
-            self.postFilterBeforeFbp = [combo.currentIndex for combo in combos]
+            if self.postFilterBeforeRr is not None:   # the filters before RR are the ones to restore
+                self.postFilterBeforeFbp, self.postFilterBeforeRr = self.postFilterBeforeRr, None
+            else:
+                self.postFilterBeforeFbp = [combo.currentIndex for combo in combos]
             for combo in combos:
                 combo.setCurrentIndex(combo.findText("None"))
         elif not fbp and self.postFilterBeforeFbp is not None:
