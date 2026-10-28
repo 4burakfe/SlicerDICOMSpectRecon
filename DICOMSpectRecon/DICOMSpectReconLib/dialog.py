@@ -37,7 +37,7 @@ RR_OSEM_FACTOR = 2    # OSEM iterations x this with resolution recovery (slower 
 RR_BSREM_FACTOR = 2
 # Butterworth cutoff (cycles/cm) the post-filter starts from, by algorithm: (static, gated). BSREM's prior
 # already controls the noise, so it gets a sharper filter.
-DEFAULT_CUTOFFS = {"OSEM": (0.45, 0.35), "BSREM": (0.6, 0.4)}
+DEFAULT_CUTOFFS = {"OSEM": (0.40, 0.35), "BSREM": (0.6, 0.4)}
 # BSREM prior strength (static, gated) without and with resolution recovery: with the PSF in the model the
 # prior suppresses the recovered resolution, so the static image goes unregularised by default.
 DEFAULT_BETAS = {False: (0.2, 0.4), True: (0.0, 0.2)}
@@ -595,11 +595,11 @@ class SpectReconDialog:
                                            "is switched off when FBP is chosen.", qt.Qt.ToolTipRole)
         self.itersSpin = qt.QSpinBox()
         self.itersSpin.setRange(1, 200)
-        self.itersSpin.setValue(4)
+        self.itersSpin.setValue(2)
         self.itersSpin.setToolTip("Conventional SPECT: 2-4 iterations are typical with a post-filter")
         self.subsetsSpin = qt.QSpinBox()
         self.subsetsSpin.setRange(1, 128)
-        self.subsetsSpin.setValue(6)
+        self.subsetsSpin.setValue(10)
         self.subsetsSpin.setToolTip("Best if it divides the number of projection angles (e.g. 6 or 10 for 60 views)")
         self.bsremItersSpin = qt.QSpinBox()
         self.bsremItersSpin.setRange(1, 200)
