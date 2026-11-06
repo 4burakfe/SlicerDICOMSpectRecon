@@ -599,8 +599,8 @@ class MotionCorrectionWindow:
         row, rows = self.rowSlider.value, self.stack.shape[1]
         projMax = float(self.stack[:, row, :].max()) or float(self.stack.max()) or 1.0
         for kind, data in (("original", self.stack), ("corrected", self.corrected)):
-            rgb = display.grayscale(_fitTo(data[slot], VIEW_SIZE), projMax, self.windows["proj"][1],
-                                    self.windows["proj"][0])
+            rgb = display.colorize(_fitTo(data[slot], VIEW_SIZE), projMax, self.petColors,
+                                   self.windows["proj"][1], self.windows["proj"][0])
             display.drawLine(rgb, row, rows)
             self.views[(kind, "projection")].setPixmap(self.renderer.toPixmap(rgb))
         self._showFrameMarkers()
