@@ -2865,7 +2865,7 @@ class SpectReconDialog:
         if self.projArray is None:
             return
         lower, upper = self.windows["proj"]
-        rgb = display.grayscale(self._fit(self.projArray[index]), self.projMax, upper, lower)
+        rgb = display.colorize(self._fit(self.projArray[index]), self.projMax, self._petColors(), upper, lower)
         row = self.sinoSlider.value
         if self.sinoSlider.isEnabled() and row < self.projArray.shape[1]:
             display.drawLine(rgb, row, self.projArray.shape[1])
