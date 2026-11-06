@@ -470,10 +470,11 @@ class MotionCorrectionWindow:
             text += f"; 1 px = {self.pixelMm:.2f} mm"
         self.statusLabel.setText("Correction: " + text)
 
-    def _colour(self, image, vmax, group, lineRow=None, rows=None, asArray=False, nearest=False):
+    def _colour(self, image, vmax, group, lineRow=None, rows=None, asArray=False, stretch=False):
         """PET-coloured in the display window of group, stretched to the square view (aspect not kept),
-        with the reference line if given; nearest neighbour (sinograms, linograms) or bicubic (axial)."""
-        fitted = display.resampleNearestTo(image, VIEW_SIZE, VIEW_SIZE) if nearest else _fitTo(image, VIEW_SIZE)
+        with the reference line if given; bicubic throughout, stretched to the square panel (sinograms,
+        linograms) or fitted with the aspect kept (axial)."""
+        fitted = display.resampleCubicTo(image, VIEW_SIZE, VIEW_SIZE, 0.0) if stretch else _fitTo(image, VIEW_SIZE)
         lower, upper = self.windows[group]
         rgb = display.colorize(fitted, vmax or 1.0, self.petColors, upper, lower)
         if lineRow is not None:
@@ -503,9 +504,9 @@ class MotionCorrectionWindow:
         linoMax = float(line.sum(axis=1).max())
         for kind, data in (("original", original), ("corrected", corrected)):
             self.sinoImages[(kind, "sinogram")] = self._colour(data.sum(axis=1), sinoMax, "sino",
-                                                               asArray=True, nearest=True)
+                                                               asArray=True, stretch=True)
             self.sinoImages[(kind, "linogram")] = self._colour(data.sum(axis=2).T, linoMax, "sino", row, rows,
-                                                               asArray=True, nearest=True)
+                                                               asArray=True, stretch=True)
 
     # ---------------- fast axial slice ----------------
     def _scheduleRecon(self):
