@@ -2826,10 +2826,10 @@ class SpectReconDialog:
             self.startProjCine()
 
     def _sinoImage(self, image, vmax, lineRow=None, rows=None):
-        """PET-coloured sinogram / linogram (RGB) stretched to the square panel (aspect not kept), with
-        the reference line when given."""
+        """PET-coloured sinogram / linogram (RGB) stretched bicubically to the square panel (aspect not
+        kept), like the reconstructed slices, with the reference line when given."""
         lower, upper = self.windows["sino"]
-        fitted = display.resampleNearestTo(image, self.viewSize, self.viewSize)
+        fitted = display.resampleCubicTo(image, self.viewSize, self.viewSize, 0.0)
         rgb = display.colorize(fitted, vmax, self._petColors(), upper, lower)
         if lineRow is not None:
             rgb = display.drawLine(rgb.copy(), lineRow, rows)
