@@ -3,13 +3,14 @@
 Every entry is a parallel-hole collimator: hole diameter, hole length and septa, the intrinsic
 resolution of the camera at 140 keV, and the keys used to recognise it from the DICOM header
 (manufacturer, words of the camera model, collimator names). The built-in entries come from the
-collimator data base PyTomography ships (taken from the SIMIND Monte Carlo program); the user's
-library is a JSON file that starts as a copy of them and can be edited in the SPECT Collimators
-module.
+collimator table PyTomography ships (pytomography/data/collimators.csv since PyTomography 4, from the
+SIMIND 9.0 collimator data base; collim.col before); the user's library is a JSON file that starts
+as a copy of them and can be edited in the SPECT Collimators module.
 
-The PSF is PyTomography's Gaussian model (as get_psfmeta_from_scanner_params): at a distance r from
+The PSF is PyTomography's Gaussian model (as io.SPECT.collimator_psf): at a distance r from
 the collimator face, sigma(r) = sqrt(((d / L_eff) r + d)^2 + intrinsic^2) x FWHM-to-sigma, with
 L_eff = L - 2 / mu(lead, photopeak energy) and the intrinsic resolution scaled with E^(-1/2).
+PyTomography 4 takes r and the parameters in mm.
 
 No Slicer dependency except libraryPath(); PyTomography is imported when used.
 """
@@ -78,7 +79,39 @@ def _pytomographyDataDir():
 
 
 def builtinCollimators():
-    """Parallel-hole collimators of PyTomography's collimator data base (cm there, mm here)."""
+    """Parallel-hole collimators of PyTomography's collimator table (mm)."""
+    try:
+        from pytomography.io.SPECT import collimators as pytomographyCollimators
+    except ImportError:
+        return _builtinCollimatorsFromCol()  # PyTomography 3 (collim.col, cm)
+    entries, seen = [], set()
+    for row in pytomographyCollimators():
+        code = row.get("code", "")
+        if row.get("kind") != "parallel" or code in seen or "-" not in code:
+            continue  # fan beam and duplicate records
+        if not row.get("hole_diameter") or not row.get("hole_length"):
+            continue
+        seen.add(code)
+        entries.append(_entry(code, row.get("type", ""), row["hole_diameter"],
+                              row.get("septal_thickness") or 0.0, row["hole_length"]))
+    return entries
+
+
+def _entry(code, description, diameter, septa, length):
+    prefix, suffix = code.split("-", 1)
+    manufacturer, models = PREFIXES.get(prefix, ("", ""))
+    names = [suffix] + [a for a in NAME_ALIASES.get(suffix, []) if a != suffix]
+    return {
+        "code": code, "description": str(description or "").strip(' "').upper(),
+        "manufacturer": manufacturer, "models": models,
+        "names": ", ".join(names), "holeDiameterMm": round(float(diameter), 3),
+        "septaMm": round(float(septa), 3), "holeLengthMm": round(float(length), 3),
+        "intrinsicMm": CZT_INTRINSIC_MM if "CZT" in models.upper() else DEFAULT_INTRINSIC_MM,
+    }
+
+
+def _builtinCollimatorsFromCol():
+    """PyTomography 3's collimator data base (collim.col, cm)."""
     try:
         path = os.path.join(_pytomographyDataDir(), "collim.col")
         with open(path) as f:
@@ -101,16 +134,8 @@ def builtinCollimators():
         if colType != 0 or code in seen or "-" not in code:
             continue  # fan beam, pinhole and duplicate records
         seen.add(code)
-        prefix, suffix = code.split("-", 1)
-        manufacturer, models = PREFIXES.get(prefix, ("", ""))
-        names = [suffix] + [a for a in NAME_ALIASES.get(suffix, []) if a != suffix]
         description = " ".join(parts[13:]).strip(' "') if len(parts) > 13 else ""
-        entries.append({
-            "code": code, "description": description, "manufacturer": manufacturer, "models": models,
-            "names": ", ".join(names), "holeDiameterMm": round(diameter, 3), "septaMm": round(septa, 3),
-            "holeLengthMm": round(length, 3),
-            "intrinsicMm": CZT_INTRINSIC_MM if "CZT" in models.upper() else DEFAULT_INTRINSIC_MM,
-        })
+        entries.append(_entry(code, description, diameter, septa, length))
     return entries
 
 
@@ -245,11 +270,14 @@ def systemResolutionMm(entry, distanceMm=100.0, energyKeV=140.0):
 
 
 def psfTransform(entry, energyKeV):
-    """PyTomography transform that models the collimator-detector response of an entry."""
+    """PyTomography transform that models the collimator-detector response of an entry.
+    psfParameters() is in cm; PyTomography 4 takes the distance and the widths in mm (the slope has
+    no unit)."""
     import numpy as np
     from pytomography.metadata.SPECT import SPECTPSFMeta
     from pytomography.transforms.SPECT import SPECTPSFTransform
-    params = list(psfParameters(entry, energyKeV))
+    slope, intercept, intrinsic = psfParameters(entry, energyKeV)
+    params = [slope, 10.0 * intercept, 10.0 * intrinsic]
     meta = SPECTPSFMeta(sigma_fit_params=params,
                         sigma_fit=lambda r, a, b, c: np.sqrt((a * r + b) ** 2 + c ** 2),
                         min_sigmas=3, shape="gaussian")

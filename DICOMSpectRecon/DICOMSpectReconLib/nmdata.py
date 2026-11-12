@@ -203,8 +203,11 @@ def cleanCtFiles(files, log=logging.info):
     return [e["file"] for e in unique]
 
 
-_FRAME_VECTOR_KEYS = ["EnergyWindowVector", "DetectorVector", "RotationVector",
-                      "AngularPositionVector", "TimeSlotVector", "PhaseVector", "SliceVector"]
+# Every per-frame vector of an NM header: all are cut to the kept frames when a gate or the summed
+# gates is written (PyTomography 4 checks that each one has NumberOfFrames entries).
+_FRAME_VECTOR_KEYS = ["EnergyWindowVector", "DetectorVector", "RotationVector", "AngularViewVector",
+                      "AngularPositionVector", "TimeSlotVector", "PhaseVector", "SliceVector",
+                      "RRIntervalVector", "TimeSliceVector"]
 
 
 def _frameVectors(ds, nFrames):

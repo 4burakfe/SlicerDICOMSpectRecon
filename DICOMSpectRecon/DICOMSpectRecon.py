@@ -56,7 +56,8 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(globals().get("__file__", "") or "
 if globals().get("__file__") and _MODULE_DIR not in sys.path:
     sys.path.insert(0, _MODULE_DIR)
 
-from DICOMSpectReconLib.reconstruction import pytomographyVersion  # noqa: E402
+from DICOMSpectReconLib.reconstruction import (PYTOMOGRAPHY_MIN_MAJOR, PYTOMOGRAPHY_REQUIREMENT,  # noqa: E402
+                                                pytomographyMajorVersion, pytomographyVersion)
 
 
 # NM projection file -> (CT file list, how it was matched), filled in during examine()
@@ -502,7 +503,23 @@ def ensureDependencies():
                 _installPytomographyKeepingTorch()
             import pytomography  # noqa: F401
 
-        # No version check: the version in use is logged and stored on every loaded volume
+        major = pytomographyMajorVersion()
+        if major and major < PYTOMOGRAPHY_MIN_MAJOR:
+            # PyTomography 4 changed its units (cm -> mm) and its SPECT readers: 3.x cannot be used
+            if not slicer.util.confirmOkCancelDisplay(
+                    f"PyTomography {pytomographyVersion()} is installed, but this module needs version "
+                    f"{PYTOMOGRAPHY_MIN_MAJOR} or later.\n\n"
+                    "Upgrade it now? Your PyTorch installation will not be changed. Slicer must be "
+                    "restarted after the upgrade.\n\n"
+                    "Note for quantitative studies: reconstructions made after the upgrade can differ "
+                    "slightly from earlier ones (the PyTomography version is stored on every volume)."):
+                return False
+            with slicer.util.WaitCursor():
+                _installPytomographyKeepingTorch()
+            slicer.util.infoDisplay("PyTomography was upgraded. Restart Slicer, then load the SPECT series again.")
+            return False
+
+        # The version in use is logged and stored on every loaded volume
         logging.info(f"SPECT recon plugin: using PyTomography {pytomographyVersion()}")
         return True
     except Exception as e:
@@ -546,7 +563,8 @@ def _ensureTorch():
 
 
 def _installPytomographyKeepingTorch():
-    """pip install pytomography with a constraint that holds torch at the installed build."""
+    """pip install (or upgrade to) PYTOMOGRAPHY_REQUIREMENT with a constraint that holds torch at
+    the installed build."""
     import importlib.metadata as metadata
     import tempfile
 
@@ -556,7 +574,7 @@ def _installPytomographyKeepingTorch():
         with open(constraints, "w") as f:
             f.write(f"torch=={torchVersion}\n")
         # List form: the constraints path is passed as one argument even if it contains spaces
-        slicer.util.pip_install(["pytomography", "--constraint", constraints])
+        slicer.util.pip_install(["--upgrade", PYTOMOGRAPHY_REQUIREMENT, "--constraint", constraints])
 
     after = metadata.version("torch")
     if after != torchVersion:

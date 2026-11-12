@@ -25,6 +25,11 @@ SCATTER_FRACTION_WARNING = 0.6  # scatter estimate above this fraction of the ph
 CT_COVERAGE_WARNING = 0.9      # fraction of SPECT slices that should contain tissue in the mu-map
 MU_MAX_PLAUSIBLE = 0.6         # /cm; far above bone at SPECT energies
 
+# PyTomography 4 changed every length to mm (it was cm) and replaced the SPECT readers and writers,
+# so this module needs it; DICOMSpectRecon.py installs or upgrades it to this range.
+PYTOMOGRAPHY_REQUIREMENT = "pytomography>=4.0,<5"
+PYTOMOGRAPHY_MIN_MAJOR = 4
+
 ALGORITHM_OSEM = "OSEM"
 ALGORITHM_BSREM = "BSREM"
 ALGORITHM_FBP = "FBP"
@@ -58,35 +63,63 @@ def pytomographyVersion():
             return "unknown"
 
 
+def pytomographyMajorVersion():
+    """Major version of the installed PyTomography (0 when it cannot be read)."""
+    try:
+        return int(str(pytomographyVersion()).split(".")[0])
+    except ValueError:
+        return 0
+
+
+def checkPytomographyVersion():
+    """Raise a clear error if an older PyTomography (3.x, lengths in cm) is the one installed."""
+    major = pytomographyMajorVersion()
+    if major and major < PYTOMOGRAPHY_MIN_MAJOR:
+        raise RuntimeError(f"PyTomography {pytomographyVersion()} is installed, but this module needs "
+                           f"{PYTOMOGRAPHY_REQUIREMENT}. Load the SPECT series again to upgrade it.")
+
+
 # ---------------------------------------------------------------------------
 # Reconstruction logic (from the original standalone app)
 # ---------------------------------------------------------------------------
 class ProjectionSet:
-    """One reconstructable dataset: the static acquisition, the summed gates, or one gate."""
+    """One reconstructable dataset: the static acquisition, the summed gates, or one gate.
+
+    PyTomography 4 reads it into its standard form: projections [window, view, r, z] with the views
+    sorted by detector angle and z running foot to head, an object grid in the patient's LPS frame
+    and every length in mm."""
 
     def __init__(self, fileNM, indexPeak, log=print, countScale=1.0, label="static"):
-        from pytomography.io.SPECT import dicom as spect_dicom
+        from pytomography.io.SPECT import read_dicom
+        checkPytomographyVersion()
         self.fileNM = fileNM
         self.label = label
         self.countScale = countScale  # undoes any scaling applied when writing the file
         self.log = log
-        self.object_meta, self.proj_meta = spect_dicom.get_metadata(fileNM, index_peak=indexPeak)
-        allProjections = spect_dicom.get_projections(fileNM)
+        allProjections, self.object_meta, self.proj_meta = read_dicom(fileNM)
+        if allProjections.ndim == 3:
+            allProjections = allProjections.unsqueeze(0)
         self.allProjections = allProjections
-        if allProjections.ndim >= 4:
-            if indexPeak >= allProjections.shape[0]:
-                raise ValueError(f"Photopeak window {indexPeak + 1} does not exist "
-                                 f"({allProjections.shape[0]} energy windows in the data).")
-            self.projections = allProjections[indexPeak]
-        else:
-            self.projections = allProjections
+        if indexPeak >= allProjections.shape[0]:
+            raise ValueError(f"Photopeak window {indexPeak + 1} does not exist "
+                             f"({allProjections.shape[0]} energy windows in the data).")
+        self.indexPeak = indexPeak
+        self.projections = allProjections[indexPeak]
 
     @property
     def nViews(self):
         try:
-            return int(np.asarray(self.proj_meta.angles).size)
+            return int(self.proj_meta.num_projections)
         except Exception:
             return int(self.projections.shape[0])
+
+    @property
+    def photonEnergyKeV(self):
+        """Photon energy of the photopeak window (the nuclide's line inside it, else its centre)."""
+        try:
+            return float(self.proj_meta.energy_windows[self.indexPeak].photon_energy)
+        except Exception:
+            return None
 
     def scatterEstimate(self, indexPeak, indexLower, indexUpper, weight=None):
         """weight None: PyTomography's width-normalised estimate. weight k (dual window only):
@@ -95,14 +128,13 @@ class ProjectionSet:
             if indexUpper is not None:
                 raise ValueError("A manual scatter weight is only used with dual energy window correction.")
             return self.allProjections[indexLower] * float(weight)
-        from pytomography.io.SPECT import dicom as spect_dicom
-        return spect_dicom.get_energy_window_scatter_estimate_projections(
-            self.fileNM, self.allProjections, indexPeak, indexLower, indexUpper)
+        from pytomography.io.SPECT import energy_window_scatter
+        return energy_window_scatter(self.allProjections, self.proj_meta, indexPeak, indexLower, indexUpper)
 
 
 class _OsemMonitor:
     """PyTomography callback: reports progress after every subset and aborts on request.
-    Duck-typed (run/finalize) so it works across PyTomography 3.x callback signatures."""
+    Duck-typed (run(object, n_iter, n_subset) and finalize(object), as PyTomography 4 calls them)."""
 
     def __init__(self, label, nIters, nSubsets, progress=None, shouldAbort=None, done=0, total=None):
         self.label = label
@@ -165,11 +197,12 @@ def _rampResponse(n):
     return np.real(np.fft.fft(h))
 
 
-def filterProjectionsFBP(projections, window, cutoff, order, pixelR, pixelZ):
+def filterProjectionsFBP(projections, window, cutoff, order, pixelR, pixelZ, ramp=True):
     """Ramp-filter SPECT projections [views, r, z] along r and apply the window in 2D (r and z,
     the way camera software applies a Butterworth/Hann pre-filter). cutoff is a fraction of the
     radial Nyquist frequency; frequencies are physical so the window is isotropic when the pixels
-    are not square. Zero padding to at least twice the size avoids wrap-around."""
+    are not square (pixelR and pixelZ in the same unit). Zero padding to at least twice the size
+    avoids wrap-around. ramp=False applies the window only (PyTomography then applies the ramp)."""
     arr = np.asarray(projections, dtype=np.float64)
     _, nr, nz = arr.shape
     padR = int(2 ** np.ceil(np.log2(max(2 * nr, 2))))
@@ -178,24 +211,32 @@ def filterProjectionsFBP(projections, window, cutoff, order, pixelR, pixelZ):
     fr = np.fft.fftfreq(padR, d=float(pixelR)) / nyquist
     fz = np.fft.fftfreq(padZ, d=float(pixelZ)) / nyquist
     f = np.sqrt(fr[:, None] ** 2 + fz[None, :] ** 2)
-    response = _rampResponse(padR)[:, None] * fbpWindow(window, f, cutoff, order)
+    response = fbpWindow(window, f, cutoff, order)
+    if ramp:
+        response = _rampResponse(padR)[:, None] * response
     spectrum = np.fft.fft2(arr, s=(padR, padZ), axes=(1, 2)) * response[None, :, :]
     return np.real(np.fft.ifft2(spectrum, axes=(1, 2)))[:, :nr, :nz]
 
 
 def filteredBackProjection(projections, systemMatrix, window, cutoff, order, pixelR, pixelZ):
-    """FBP: (pi / number of views) x backprojection of the filtered projections. The system matrix
-    must model only the geometry (no attenuation or PSF). Units are the same as OSEM's: an image
-    whose forward projection reproduces the projections (counts per voxel per view)."""
+    """FBP: the window is applied here in 2D (r and z), then PyTomography's filtered back projection
+    applies the band-limited ramp along r and back projects with the inverse rotation, weighted by
+    pi / number of views. (Since PyTomography 4 the system matrix's backward() is the exact transpose
+    of the projector, whose interpolation weights are not those an analytic inverse needs, so it is no
+    longer used for FBP.) Only the geometry of the system matrix is used. Units are the same as
+    OSEM's: an image whose forward projection reproduces the projections (counts per voxel per view)."""
     import torch
+    from pytomography.algorithms import FilteredBackProjection
     device = projections.device if hasattr(projections, "device") else None
     data = projections.detach().cpu().numpy() if hasattr(projections, "detach") else np.asarray(projections)
-    filtered = filterProjectionsFBP(data, window, cutoff, order, pixelR, pixelZ)
+    if window == "Ramp" and float(cutoff) >= 1.0:
+        filtered = data.astype(np.float32)  # the plain band-limited ramp
+    else:
+        filtered = filterProjectionsFBP(data, window, cutoff, order, pixelR, pixelZ, ramp=False)
     filtered = torch.as_tensor(filtered, dtype=torch.float32)
     if device is not None:
         filtered = filtered.to(device)
-    nViews = int(filtered.shape[0])
-    return systemMatrix.backward(filtered) * (np.pi / nViews)
+    return FilteredBackProjection(filtered, systemMatrix, filter=None)()
 
 
 def changCorrection(attenuatedMatrix, geometricMatrix, maximum=20.0):
@@ -304,31 +345,40 @@ class SpectReconLogic:
             self.log(f"Projections shape: {tuple(self.projections.shape)}, total counts: {self.projections.sum().item():.0f}")
             self.log(f"Angles: n={angles.size}, first={angles[0]:.2f}, last={angles[-1]:.2f}, "
                      f"step={(angles[1] - angles[0]) if angles.size > 1 else 0:.2f}")
-            self.log(f"Radii (cm): min={radii.min():.2f}, max={radii.max():.2f}")
-            self.log(f"Object shape: {tuple(self.object_meta.shape)}, voxel (cm): {tuple(self.object_meta.dr)}")
+            self.log(f"Radii (mm): min={radii.min():.1f}, max={radii.max():.1f}")
+            self.log(f"Object shape: {tuple(self.object_meta.shape)}, voxel (mm): "
+                     f"{tuple(round(float(d), 3) for d in self.object_meta.dr)}")
+            energy = self.staticSet.photonEnergyKeV
+            if energy:
+                self.log(f"Photopeak photon energy: {energy:g} keV")
         except Exception as e:
             self.log(f"(Could not print full fingerprint: {e})")
 
     def getAttenuationMap(self):
-        """Attenuation map resampled onto the SPECT object grid (cached).
+        """Attenuation map (1/mm, as PyTomography 4 uses it) on the SPECT object grid (cached).
         The gates share the static geometry, so one map serves all reconstructions."""
         if self.attenuationMap is not None:
             return self.attenuationMap
-        from pytomography.io.SPECT import dicom as spect_dicom
+        from pytomography.io import attenuation_map
         if not self.ctFiles:
             raise ValueError("Attenuation correction is on, but no CT series is selected.")
-        self.log(f"Building attenuation map from {len(self.ctFiles)} CT slices...")
-        amap = spect_dicom.get_attenuation_map_from_CT_slices(
-            self.ctFiles, self.staticSet.fileNM, index_peak=self.indexPeak)
+        energy = self.staticSet.photonEnergyKeV
+        if not energy:
+            raise ValueError("The photon energy of the photopeak window is unknown, so the CT cannot be "
+                             "converted to attenuation coefficients.")
+        self.log(f"Building attenuation map from {len(self.ctFiles)} CT slices at {energy:g} keV...")
+        amap = attenuation_map(list(self.ctFiles), self.staticSet.object_meta, energy)
         self.log(f"  -> Attenuation map shape {tuple(amap.shape)}, "
-                 f"mean mu {amap.mean().item():.4f} /cm, max mu {amap.max().item():.4f} /cm")
+                 f"mean mu {10.0 * amap.mean().item():.4f} /cm, max mu {10.0 * amap.max().item():.4f} /cm")
         self.checkAttenuationMap(amap)
         self.attenuationMap = amap
         return amap
 
     def checkAttenuationMap(self, amap):
-        """Guard rails: the CT has to overlap the SPECT field, and mu values have to be plausible."""
+        """Guard rails: the CT has to overlap the SPECT field, and mu values have to be plausible.
+        amap is in 1/mm; the thresholds are in 1/cm."""
         arr = amap.detach().cpu().numpy() if hasattr(amap, "detach") else np.asarray(amap)
+        arr = 10.0 * arr  # 1/mm -> 1/cm
         if not np.all(np.isfinite(arr)):
             raise ValueError("The attenuation map contains invalid values (NaN/inf) - check the CT series.")
         if arr.ndim < 3 or float(arr.max()) <= 0.01:
@@ -368,148 +418,125 @@ class SpectReconLogic:
         from the projections and corrects attenuation with the first order Chang method.
         Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
         import torch
-        import SimpleITK as sitk
-        from pytomography.io.SPECT import dicom as spect_dicom
         from pytomography.projectors.SPECT import SPECTSystemMatrix
         from pytomography.likelihoods import PoissonLogLikelihood
         from pytomography.algorithms import OSEM
 
         projectionSet = projectionSet or self.staticSet
-        base_temp_dir = None
-        try:
-            nViews = projectionSet.nViews
-            if algorithm not in ALGORITHMS:
-                raise ValueError(f"Unknown reconstruction algorithm '{algorithm}'.")
-            if algorithm in ITERATIVE_ALGORITHMS:
-                if subsets < 1 or subsets > nViews:
-                    raise ValueError(f"{subsets} subsets requested, but there are only {nViews} projection views.")
-                if iters < 1:
-                    raise ValueError(f"At least one {algorithm} iteration is needed.")
-                if algorithm == ALGORITHM_BSREM and (not bsrem or float(bsrem.get("beta", -1)) < 0):
-                    raise ValueError("BSREM needs a prior strength (beta) of 0 or more.")
-            elif not fbp or fbp.get("window") not in FBP_WINDOWS:
-                raise ValueError("FBP needs a filter window (" + ", ".join(FBP_WINDOWS) + ").")
+        nViews = projectionSet.nViews
+        if algorithm not in ALGORITHMS:
+            raise ValueError(f"Unknown reconstruction algorithm '{algorithm}'.")
+        if algorithm in ITERATIVE_ALGORITHMS:
+            if subsets < 1 or subsets > nViews:
+                raise ValueError(f"{subsets} subsets requested, but there are only {nViews} projection views.")
+            if iters < 1:
+                raise ValueError(f"At least one {algorithm} iteration is needed.")
+            if algorithm == ALGORITHM_BSREM and (not bsrem or float(bsrem.get("beta", -1)) < 0):
+                raise ValueError("BSREM needs a prior strength (beta) of 0 or more.")
+        elif not fbp or fbp.get("window") not in FBP_WINDOWS:
+            raise ValueError("FBP needs a filter window (" + ", ".join(FBP_WINDOWS) + ").")
 
-            obj2obj_transforms = []
-            if useAttenuationCorrection:
-                from pytomography.transforms.SPECT import SPECTAttenuationTransform
-                obj2obj_transforms.append(SPECTAttenuationTransform(self.getAttenuationMap()))
-            if psf is not None:
-                if algorithm == ALGORITHM_FBP:
-                    self.log("  -> Resolution recovery is not used with FBP (iterative algorithms only).")
-                else:
-                    from . import collimators
-                    entry, energyKeV = psf["entry"], float(psf["energyKeV"])
-                    self.log(f"Resolution recovery: {collimators.describe(entry, energyKeV)}")
-                    obj2obj_transforms.append(collimators.psfTransform(entry, energyKeV))
-
-            photopeakCounts = float(projectionSet.projections.sum().item())
-            additive_term = None
-            scatterCounts = 0.0
-            if scatter is not None:
-                indexLower, indexUpper, weight = (tuple(scatter) + (None,))[:3]
-                if indexLower is None:
-                    raise ValueError("Scatter correction needs a lower energy window.")
-                method = "dual" if indexUpper is None else "triple"
-                weightNote = "" if weight is None else f", weight {float(weight):g} x lower window"
-                self.log(f"Estimating scatter ({method} energy window{weightNote}) for {projectionSet.label}...")
-                additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper, weight)
-                if not bool(torch.isfinite(additive_term).all()):
-                    raise ValueError("The scatter estimate contains invalid values - check the energy windows.")
-                scatterCounts = float(additive_term.sum().item())
-                fraction = scatterCounts / max(1e-9, photopeakCounts)
-                self.log(f"  -> Scatter counts: {scatterCounts:.0f} ({100.0 * fraction:.1f}% of photopeak)")
-                if scatterCounts <= 0:
-                    self.log("WARNING: the scatter windows hold no counts - scatter correction has no effect.")
-                elif fraction > SCATTER_FRACTION_WARNING:
-                    self.log(f"WARNING: estimated scatter is {100.0 * fraction:.0f}% of the photopeak - "
-                             "check that the scatter windows are the right ones.")
-
-            # 2. Build System Matrix
-            corrections = [name for name, used in (("attenuation correction", useAttenuationCorrection),
-                                                    ("resolution recovery", psf is not None
-                                                     and algorithm != ALGORITHM_FBP)) if used]
-            self.log("Building System Matrix"
-                     + (f" (with {' and '.join(corrections)})..." if corrections else "..."))
-            system_matrix = SPECTSystemMatrix(
-                obj2obj_transforms=obj2obj_transforms,
-                proj2proj_transforms=[],
-                object_meta=projectionSet.object_meta,
-                proj_meta=projectionSet.proj_meta
-            )
-
-            # 3. Reconstruction
+        obj2obj_transforms = []
+        if useAttenuationCorrection:
+            from pytomography.transforms.SPECT import SPECTAttenuationTransform
+            obj2obj_transforms.append(SPECTAttenuationTransform(self.getAttenuationMap()))
+        if psf is not None:
             if algorithm == ALGORITHM_FBP:
-                reconstructed_object = self._reconstructFBP(projectionSet, system_matrix, additive_term,
-                                                            useAttenuationCorrection, fbp)
-            elif algorithm == ALGORITHM_BSREM:
-                reconstructed_object = self._reconstructBSREM(projectionSet, system_matrix, additive_term,
-                                                              iters, subsets, bsrem)
+                self.log("  -> Resolution recovery is not used with FBP (iterative algorithms only).")
             else:
-                self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
-                if subsets > 1 and nViews % subsets != 0:
-                    self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
-                likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections,
-                                                  additive_term=additive_term)
-                reconstruction_algorithm = OSEM(likelihood)
-                monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort)
-                reconstructed_object = reconstruction_algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
-                self.log("OSEM reconstruction complete.")
+                from . import collimators
+                entry, energyKeV = psf["entry"], float(psf["energyKeV"])
+                self.log(f"Resolution recovery: {collimators.describe(entry, energyKeV)}")
+                obj2obj_transforms.append(collimators.psfTransform(entry, energyKeV))
 
-            if not bool(torch.isfinite(reconstructed_object).all()):
-                raise ValueError("The reconstruction contains invalid values (NaN/inf).")
-            if float(reconstructed_object.max().item()) <= 0:
-                raise ValueError("The reconstruction is empty (all voxels zero).")
+        photopeakCounts = float(projectionSet.projections.sum().item())
+        additive_term = None
+        scatterCounts = 0.0
+        if scatter is not None:
+            indexLower, indexUpper, weight = (tuple(scatter) + (None,))[:3]
+            if indexLower is None:
+                raise ValueError("Scatter correction needs a lower energy window.")
+            method = "dual" if indexUpper is None else "triple"
+            weightNote = "" if weight is None else f", weight {float(weight):g} x lower window"
+            self.log(f"Estimating scatter ({method} energy window{weightNote}) for {projectionSet.label}...")
+            additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper, weight)
+            if not bool(torch.isfinite(additive_term).all()):
+                raise ValueError("The scatter estimate contains invalid values - check the energy windows.")
+            scatterCounts = float(additive_term.sum().item())
+            fraction = scatterCounts / max(1e-9, photopeakCounts)
+            self.log(f"  -> Scatter counts: {scatterCounts:.0f} ({100.0 * fraction:.1f}% of photopeak)")
+            if scatterCounts <= 0:
+                self.log("WARNING: the scatter windows hold no counts - scatter correction has no effect.")
+            elif fraction > SCATTER_FRACTION_WARNING:
+                self.log(f"WARNING: estimated scatter is {100.0 * fraction:.0f}% of the photopeak - "
+                         "check that the scatter windows are the right ones.")
 
-            # Guard rail: the fitted model should reproduce the measured counts
-            consistency = None
-            try:
-                with torch.no_grad():
-                    modelCounts = float(system_matrix.forward(reconstructed_object).sum().item()) + scatterCounts
-                consistency = modelCounts / max(1e-9, photopeakCounts)
-                self.log(f"  -> Data consistency (model / measured counts): {consistency:.3f}")
-                if abs(consistency - 1.0) > CONSISTENCY_TOLERANCE:
-                    self.log("WARNING: the reconstruction does not reproduce the measured counts well "
-                             "(activity outside the field of view, too few iterations, or a geometry problem).")
-            except Exception as e:
-                self.log(f"  -> (Data consistency check skipped: {e})")
+        # 2. Build System Matrix
+        corrections = [name for name, used in (("attenuation correction", useAttenuationCorrection),
+                                                ("resolution recovery", psf is not None
+                                                 and algorithm != ALGORITHM_FBP)) if used]
+        self.log("Building System Matrix"
+                 + (f" (with {' and '.join(corrections)})..." if corrections else "..."))
+        system_matrix = SPECTSystemMatrix(
+            obj2obj_transforms=obj2obj_transforms,
+            proj2proj_transforms=[],
+            object_meta=projectionSet.object_meta,
+            proj_meta=projectionSet.proj_meta
+        )
 
-            # Undo any scaling applied when the projections were written (summed gates)
-            countScale = float(projectionSet.countScale)
-            if countScale != 1.0:
-                reconstructed_object = reconstructed_object * countScale
+        # 3. Reconstruction
+        if algorithm == ALGORITHM_FBP:
+            reconstructed_object = self._reconstructFBP(projectionSet, system_matrix, additive_term,
+                                                        useAttenuationCorrection, fbp)
+        elif algorithm == ALGORITHM_BSREM:
+            reconstructed_object = self._reconstructBSREM(projectionSet, system_matrix, additive_term,
+                                                          iters, subsets, bsrem)
+        else:
+            self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
+            if subsets > 1 and nViews % subsets != 0:
+                self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
+            likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections,
+                                              additive_term=additive_term)
+            reconstruction_algorithm = OSEM(likelihood)
+            monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort)
+            reconstructed_object = reconstruction_algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
+            self.log("OSEM reconstruction complete.")
 
-            stats = {
-                "label": projectionSet.label,
-                "nViews": nViews,
-                "photopeakCounts": photopeakCounts * countScale,
-                "scatterCounts": scatterCounts * countScale,
-                "nativeSum": float(reconstructed_object.sum().item()),
-                "consistency": consistency,
-            }
+        if not bool(torch.isfinite(reconstructed_object).all()):
+            raise ValueError("The reconstruction contains invalid values (NaN/inf).")
+        if float(reconstructed_object.max().item()) <= 0:
+            raise ValueError("The reconstruction is empty (all voxels zero).")
 
-            # 4. Save to temporary DICOM to establish spatial formatting
-            self.log("Exporting to spatial 3D DICOM format...")
-            base_temp_dir = tempfile.mkdtemp(prefix="recon_base_")
-            target_dicom_dir = os.path.join(base_temp_dir, "dicom_output")
-            spect_dicom.save_dcm(
-                save_path=target_dicom_dir,
-                object=reconstructed_object,
-                file_NM=projectionSet.fileNM,
-                recon_name="temp_3d_recon"
-            )
+        # Guard rail: the fitted model should reproduce the measured counts
+        consistency = None
+        try:
+            with torch.no_grad():
+                modelCounts = float(system_matrix.forward(reconstructed_object).sum().item()) + scatterCounts
+            consistency = modelCounts / max(1e-9, photopeakCounts)
+            self.log(f"  -> Data consistency (model / measured counts): {consistency:.3f}")
+            if abs(consistency - 1.0) > CONSISTENCY_TOLERANCE:
+                self.log("WARNING: the reconstruction does not reproduce the measured counts well "
+                         "(activity outside the field of view, too few iterations, or a geometry problem).")
+        except Exception as e:
+            self.log(f"  -> (Data consistency check skipped: {e})")
 
-            # 5. Read 3D DICOM back with SimpleITK (correct geometry)
-            reader = sitk.ImageSeriesReader()
-            dicom_names = reader.GetGDCMSeriesFileNames(target_dicom_dir)
-            if not dicom_names:
-                raise ValueError("Failed to generate intermediate DICOM slices.")
-            reader.SetFileNames(dicom_names)
-            image = reader.Execute()
-            return sitk.Cast(image, sitk.sitkFloat32), stats
-        finally:
-            if base_temp_dir and os.path.exists(base_temp_dir):
-                shutil.rmtree(base_temp_dir, ignore_errors=True)
+        # Undo any scaling applied when the projections were written (summed gates)
+        countScale = float(projectionSet.countScale)
+        if countScale != 1.0:
+            reconstructed_object = reconstructed_object * countScale
+
+        stats = {
+            "label": projectionSet.label,
+            "nViews": nViews,
+            "photopeakCounts": photopeakCounts * countScale,
+            "scatterCounts": scatterCounts * countScale,
+            "nativeSum": float(reconstructed_object.sum().item()),
+            "consistency": consistency,
+        }
+
+        # 4. The image in the patient's frame, from PyTomography's object grid (float32, no
+        # intermediate 16-bit DICOM)
+        return objectToImage(reconstructed_object, projectionSet.object_meta), stats
 
 
     def _reconstructBSREM(self, projectionSet, system_matrix, additive_term, iters, subsets, bsrem):
@@ -552,8 +579,8 @@ class SpectReconLogic:
         from pytomography.projectors.SPECT import SPECTSystemMatrix
 
         window, cutoffCm, order = fbp["window"], float(fbp.get("cutoff", 1.0)), int(fbp.get("order", 10))
-        pixelR, pixelZ = (float(d) for d in projectionSet.proj_meta.dr[:2])  # cm
-        fraction, clipped = cutoffFraction(cutoffCm, 10.0 * pixelR)
+        pixelR, pixelZ = (float(d) for d in projectionSet.proj_meta.dr[:2])  # mm
+        fraction, clipped = cutoffFraction(cutoffCm, pixelR)
         text = f"{window} window, cutoff {cutoffCm:.2f} cycles/cm = {fraction:.2f} x Nyquist"
         if clipped:
             text += " (limited to the Nyquist frequency)"
@@ -588,6 +615,21 @@ class SpectReconLogic:
             self.progress(projectionSet.label, 1, 1, f"{projectionSet.label}: filtered backprojection done")
         self.log("FBP reconstruction complete.")
         return image
+
+
+def objectToImage(obj, objectMeta):
+    """SimpleITK float image of a PyTomography object [x, y, z] placed by its grid: PyTomography 4
+    keeps objects in DICOM's patient frame (LPS mm, index k = 0 the most inferior slice), the frame
+    SimpleITK uses, so the direction is the identity and the origin is the centre of voxel 0."""
+    import SimpleITK as sitk
+    arr = obj.detach().cpu().numpy() if hasattr(obj, "detach") else np.asarray(obj)
+    image = sitk.GetImageFromArray(np.ascontiguousarray(np.transpose(arr, (2, 1, 0)), dtype=np.float32))
+    affine = np.asarray(objectMeta.affine, dtype=np.float64)
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    image.SetSpacing(tuple(float(s) for s in spacing))
+    image.SetOrigin(tuple(float(v) for v in affine[:3, 3]))
+    image.SetDirection(tuple(float(v) for v in (affine[:3, :3] / spacing).ravel()))
+    return image
 
 
 def countScalingFactor(stats, mode):

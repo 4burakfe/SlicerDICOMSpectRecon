@@ -117,7 +117,8 @@ a middle double-click resets it.
 
 *Nuclear Medicine > SPECT Collimators* edits the collimator library used for resolution recovery (a JSON
 file next to Slicer's settings). It starts with the parallel-hole collimators that PyTomography ships
-(from the SIMIND data base [1]) and shows each one's system resolution at 10 cm / 140 keV to compare with the
+(from the SIMIND 9.0 data base [1]; PyTomography 4 updated some dimensions, e.g. G8-LUHR, GO-LEHR,
+SI-LEHR, so a library created with PyTomography 3 keeps the older values until **Restore defaults**) and shows each one's system resolution at 10 cm / 140 keV to compare with the
 datasheet. Add, Duplicate, Delete and edit the cells, then **Save**; **Restore defaults** puts back the
 built-in list. *Test header matching* shows which collimator a header (manufacturer, model, collimator
 name) gets. Reconstruction windows read the library when they open.
@@ -125,7 +126,11 @@ name) gets. Reconstruction windows read the library when they open.
 ## Requirements
 
 PyTorch comes from Slicer's **PyTorch** extension (installed as a dependency, the module offers to install
-the right CPU/CUDA build); PyTomography is installed on first use with PyTorch kept at that build.
+the right CPU/CUDA build); PyTomography 4 (`pytomography>=4.0,<5`) is installed on first use with PyTorch
+kept at that build. If PyTomography 3 is installed, the module offers to upgrade it: PyTomography 4 works in
+mm instead of cm and replaced its SPECT readers, so 3.x is no longer supported. The PyTomography version is
+stored on every reconstructed volume; for quantitative studies, do not mix reconstructions made with 3.x
+and 4.x without checking them against each other.
 A GPU makes reconstruction much faster.
 
 ## Layout
