@@ -767,3 +767,232 @@ def filterDescription(params):
     if params["filter"] == "Hann":
         return f"Hann cutoff={params['cutoff']:.2f} cycles/cm"
     return "None"
+
+
+# ---------------------------------------------------------------------------
+# Multi-bed acquisitions: every bed reconstructed alike, then stitched into one image
+# ---------------------------------------------------------------------------
+def bedTimingFactors(files, referenceFile, log=print):
+    """Factor that brings each bed's counts to the reference bed's counting time and time point:
+    (T_ref / T_k) x exp(ln2 x (mid_k - mid_ref) / half-life). A bed scanned longer, or earlier
+    (before more decay), holds more counts than the reference would have; the factor removes that, so
+    one calibration and one decay time (the reference bed's) hold for the whole stitched image.
+    Returns ({file: factor}, {file: note})."""
+    import math
+    from .nmdata import readAcquisitionInfo
+    from .quantification import fromIso
+
+    infos = {path: readAcquisitionInfo(path) for path in files}
+    reference = infos[referenceFile]
+    referenceTime = reference.get("totalViewTimeSec")
+    referenceMid = fromIso(reference.get("mid"))
+    halfLife = reference.get("halfLifeSec")
+    factors, notes = {}, {}
+    for path in files:
+        info = infos[path]
+        factor, parts = 1.0, []
+        time = info.get("totalViewTimeSec")
+        if time and referenceTime:
+            factor *= float(referenceTime) / float(time)
+            parts.append(f"time {float(time):.1f} s")
+        elif path != referenceFile:
+            log(f"WARNING: counting time of {os.path.basename(path)} or of the reference bed unknown - "
+                "beds not normalised for counting time.")
+        mid = fromIso(info.get("mid"))
+        if mid and referenceMid and halfLife:
+            dt = (mid - referenceMid).total_seconds()
+            factor *= math.exp(math.log(2.0) * dt / float(halfLife))
+            parts.append(f"mid {dt:+.0f} s")
+        elif path != referenceFile:
+            log(f"WARNING: scan time of {os.path.basename(path)}, of the reference bed, or the half-life "
+                "unknown - beds not decay corrected to the reference bed.")
+        factors[path] = factor
+        notes[path] = ", ".join(parts)
+    return factors, notes
+
+
+def bedStitchingWeights(offsets, nSlices):
+    """Axial weights [nSlices] of each bed, for beds whose first slice is at offsets (slices, sorted
+    ascending) of the stitched image. A bed's first and last slice get no weight (the edge slices of a
+    SPECT reconstruction are poorly sampled); where two beds overlap the weights ramp linearly from
+    one bed to the other and sum to 1, so counts are kept and no step shows at the junction."""
+    weights = []
+    for _ in offsets:
+        w = np.zeros(nSlices)
+        w[1:nSlices - 1] = 1.0
+        weights.append(w)
+    for i in range(len(offsets) - 1):
+        first = offsets[i + 1] + 1               # first slice the upper bed gives
+        last = offsets[i] + nSlices - 2          # last slice the lower bed gives
+        count = last - first + 1
+        if count <= 0:
+            continue                             # the beds abut, or a gap is between them
+        g = np.arange(first, last + 1)
+        up = (g - first + 1) / (count + 1.0)
+        weights[i + 1][g - offsets[i + 1]] *= up
+        weights[i][g - offsets[i]] *= 1.0 - up
+    # three beds over one slice (only with very short steps): weights are renormalised to sum to 1
+    total = np.zeros(offsets[-1] + nSlices)
+    for w, o in zip(weights, offsets):
+        total[o:o + nSlices] += w
+    for w, o in zip(weights, offsets):
+        covered = total[o:o + nSlices]
+        w[covered > 0] /= covered[covered > 0]
+    return weights
+
+
+def stitchBedImages(images, log=print):
+    """Stitch SimpleITK bed images (same voxel size and matrix, identity direction, k = 0 inferior;
+    any order) along patient z. Returns (stitched image, offsets of the beds in slices, in the order of
+    images)."""
+    import SimpleITK as sitk
+    spacing = np.array(images[0].GetSpacing())
+    size = images[0].GetSize()
+    for image in images[1:]:
+        if image.GetSize() != size or not np.allclose(image.GetSpacing(), spacing, rtol=1e-4):
+            raise ValueError("The beds do not have the same matrix and voxel size - they cannot be stitched.")
+    origins = np.array([image.GetOrigin() for image in images])
+    order = np.argsort(origins[:, 2], kind="stable")
+    lowest = images[order[0]]
+    shiftXY = np.abs(origins[:, :2] - origins[order[0], :2]).max()
+    if shiftXY > 0.05 * spacing[0]:
+        log(f"WARNING: the beds are shifted by up to {shiftXY:.1f} mm across the table; they are stitched "
+            "slice by slice without that shift.")
+    exact = (origins[:, 2] - origins[order[0], 2]) / spacing[2]
+    offsets = np.round(exact).astype(int)
+    if np.abs(exact - offsets).max() > 0.05:
+        log(f"Note: the bed steps are not a whole number of slices (up to {np.abs(exact - offsets).max():.2f} "
+            "slice off); each bed is placed at the nearest slice.")
+    nSlices = size[2]
+    sortedOffsets = [int(offsets[i]) for i in order]
+    weights = bedStitchingWeights(sortedOffsets, nSlices)
+    out = np.zeros((sortedOffsets[-1] + nSlices, size[1], size[0]), dtype=np.float64)
+    for w, o, i in zip(weights, sortedOffsets, order):
+        out[o:o + nSlices] += sitk.GetArrayFromImage(images[i]).astype(np.float64) * w[:, None, None]
+    stitched = sitk.GetImageFromArray(out.astype(np.float32))
+    stitched.SetSpacing(lowest.GetSpacing())
+    stitched.SetOrigin(lowest.GetOrigin())
+    stitched.SetDirection(lowest.GetDirection())
+    for i in range(len(sortedOffsets) - 1):
+        overlap = sortedOffsets[i] + nSlices - sortedOffsets[i + 1]
+        if overlap > 2:
+            log(f"  -> Beds {i + 1} and {i + 2} overlap by {overlap} slices ({overlap * spacing[2]:.0f} mm): "
+                f"blended over {overlap - 2} slices")
+        elif overlap > 0:
+            log(f"  -> Beds {i + 1} and {i + 2} overlap by only {overlap} slice(s): edge slices left out, no blending")
+        else:
+            log(f"WARNING: a gap of {-overlap} slices between beds {i + 1} and {i + 2} (zero in the stitched image)")
+    return stitched, [int(o) for o in offsets]
+
+
+class MultiBedLogic:
+    """Several bed positions reconstructed with the same settings and stitched into one image.
+
+    Each bed is read and reconstructed by its own SpectReconLogic (attenuation map from the same CT on
+    the bed's own grid). Every bed is brought to the reference bed's counting time and time point
+    (bedTimingFactors) before stitching, so quantification uses the reference bed's header. Offers what
+    the dialog uses of SpectReconLogic; gated and motion corrected reconstruction are not offered."""
+
+    isGated = False
+    motionKey = None
+
+    def __init__(self, files, log=print, ctFiles=None, indexPeak=0, progress=None, shouldAbort=None):
+        self.files = list(files)
+        self.inputDcm = self.files[0]   # the reference bed
+        self.log = log
+        self.indexPeak = indexPeak
+        self.beds = []
+        self.referenceSlices = None     # (first slice, slices) of the reference bed in the stitched image
+        self.bedNotes = []
+        try:
+            for i, path in enumerate(self.files):
+                log(f"--- Bed {i + 1} of {len(self.files)}: {os.path.basename(path)}"
+                    + (" (reference bed)" if i == 0 else ""))
+                bed = SpectReconLogic(path, log, ctFiles, indexPeak, progress=progress, shouldAbort=shouldAbort)
+                if bed.isGated:
+                    raise ValueError(f"{os.path.basename(path)} is gated; gated multi-bed studies are not supported.")
+                bed.staticSet.label = f"bed {i + 1}/{len(self.files)}"
+                self.beds.append(bed)
+            reference = self.beds[0]
+            for bed in self.beds[1:]:
+                if tuple(bed.object_meta.shape) != tuple(reference.object_meta.shape) or \
+                        not np.allclose(bed.object_meta.dr, reference.object_meta.dr, rtol=1e-4):
+                    raise ValueError("The beds have different matrices or voxel sizes - they cannot be stitched.")
+                if bed.nViews != reference.nViews:
+                    raise ValueError("The beds have different numbers of views.")
+            factors, notes = bedTimingFactors(self.files, self.inputDcm, log)
+            for i, (path, bed) in enumerate(zip(self.files, self.beds)):
+                bed.staticSet.countScale *= factors[path]
+                self.bedNotes.append({"file": path, "factor": factors[path], "note": notes[path]})
+                log(f"Bed {i + 1}: counts x {factors[path]:.5f} to the reference bed"
+                    + (f" ({notes[path]})" if notes[path] else ""))
+        except Exception:
+            self.cleanup()
+            raise
+        self.staticSet = reference.staticSet
+        self.object_meta = reference.object_meta
+        self.proj_meta = reference.proj_meta
+        self.projections = reference.projections
+        self.nViews = reference.nViews
+        self.nGates = 1
+        self.gateNumbers = []
+
+    @property
+    def ctFiles(self):
+        return self.beds[0].ctFiles if self.beds else None
+
+    @ctFiles.setter
+    def ctFiles(self, files):
+        for bed in self.beds:
+            bed.ctFiles = files
+
+    @property
+    def attenuationMap(self):
+        return self.beds[0].attenuationMap if self.beds else None
+
+    @attenuationMap.setter
+    def attenuationMap(self, value):
+        for bed in self.beds:
+            bed.attenuationMap = value
+
+    def gateSet(self, gateNumber):
+        raise ValueError("Gated reconstruction is not available for multi-bed studies.")
+
+    def cleanup(self):
+        for bed in self.beds:
+            bed.cleanup()
+
+    def reconstruct(self, iters, subsets, useAttenuationCorrection=False, scatter=None, projectionSet=None,
+                    algorithm=ALGORITHM_OSEM, fbp=None, bsrem=None, psf=None):
+        if projectionSet is not None:
+            raise ValueError("Multi-bed reconstruction works on the static beds only.")
+        images, bedStats = [], []
+        for i, bed in enumerate(self.beds):
+            self.log(f"--- Bed {i + 1} of {len(self.beds)}: {os.path.basename(bed.inputDcm)}")
+            image, stats = bed.reconstruct(iters, subsets, useAttenuationCorrection, scatter,
+                                           algorithm=algorithm, fbp=fbp, bsrem=bsrem, psf=psf)
+            images.append(image)
+            bedStats.append(stats)
+        self.log(f"Stitching {len(images)} beds...")
+        stitched, offsets = stitchBedImages(images, self.log)
+        self.referenceSlices = (offsets[0], images[0].GetSize()[2])
+        consistencies = [(s["consistency"], s["photopeakCounts"]) for s in bedStats if s["consistency"] is not None]
+        consistency = (sum(c * w for c, w in consistencies) / max(1e-9, sum(w for _, w in consistencies))
+                       if consistencies else None)
+        stats = {
+            "label": f"{len(images)} beds",
+            "nViews": bedStats[0]["nViews"],
+            "photopeakCounts": sum(s["photopeakCounts"] for s in bedStats),
+            "scatterCounts": sum(s["scatterCounts"] for s in bedStats),
+            # the beds' own sums: Match detected primary counts uses sum(primary) / sum(native) over the beds
+            "nativeSum": sum(s["nativeSum"] for s in bedStats),
+            "consistency": consistency,
+            "beds": len(images),
+            "bedOffsets": offsets,
+            "bedConsistency": [s["consistency"] for s in bedStats],
+        }
+        import SimpleITK as sitk
+        total = float(sitk.GetArrayViewFromImage(stitched).sum())
+        bedSums = ", ".join(f"{s['nativeSum']:.6g}" for s in bedStats)
+        self.log(f"Stitched image: {stitched.GetSize()[2]} slices, total {total:.6g} (beds: {bedSums})")
+        return stitched, stats

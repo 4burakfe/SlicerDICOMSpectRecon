@@ -914,3 +914,105 @@ def describeTiming(acq):
     else:
         text = "1 detector recorded - " + text
     return text
+
+
+# ---------------------------------------------------------------------------
+# Multi-bed acquisitions: the other bed positions of a study
+# ---------------------------------------------------------------------------
+BED_DUPLICATE_FRACTION = 0.2   # beds closer than this fraction of the axial FOV are the same position
+BED_MAX_STEP_FRACTION = 1.05   # neighbouring beds at most this fraction of the axial FOV apart
+
+
+def _rounded(values, digits=3):
+    try:
+        return tuple(round(float(v), digits) for v in values)
+    except TypeError:
+        return (round(float(values), digits),)
+
+
+def bedInfo(filePath):
+    """What decides whether two NM files are bed positions of one multi-bed acquisition: the
+    study, frame of reference, matrix, views and energy windows (the 'key'), and the axial centre
+    of the bed in mm (patient z). None when the file is not a non-gated SPECT projection file or
+    its position cannot be read."""
+    try:
+        import pydicom
+        ds = pydicom.dcmread(filePath, stop_before_pixels=True)
+    except Exception:
+        return None
+    if str(getattr(ds, "Modality", "")).strip().upper() != "NM":
+        return None
+    imageType = [str(v).strip().upper() for v in (getattr(ds, "ImageType", None) or [])]
+    if "TOMO" not in imageType or "RECON TOMO" in imageType or "GATED TOMO" in imageType:
+        return None
+    nFrames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    slots = getattr(ds, "TimeSlotVector", None)
+    if slots is not None and len(set(np.atleast_1d(np.asarray(slots, dtype=int)).tolist())) > 1:
+        return None   # gated
+    rotation = _first(getattr(ds, "RotationInformationSequence", None))
+    detector = _first(getattr(ds, "DetectorInformationSequence", None))
+    try:
+        rows = int(ds.Rows)
+        spacing = [float(v) for v in ds.PixelSpacing]
+        position = [float(v) for v in detector.ImagePositionPatient]
+        orientation = [float(v) for v in detector.ImageOrientationPatient]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    # centre of the detector rows along patient z: the rows run along the column direction (IOP[3:6])
+    centreZ = position[2] + np.sign(orientation[5]) * (rows - 1) / 2.0 * spacing[0]
+    windows = []
+    for item in getattr(ds, "EnergyWindowInformationSequence", None) or []:
+        ranges = getattr(item, "EnergyWindowRangeSequence", None) or []
+        windows.append(tuple(_rounded((getattr(r, "EnergyWindowLowerLimit", 0) or 0,
+                                       getattr(r, "EnergyWindowUpperLimit", 0) or 0), 1) for r in ranges))
+    frame = str(getattr(ds, "FrameOfReferenceUID", "") or "")
+    key = (str(getattr(ds, "StudyInstanceUID", "") or ""),
+           ("frame", frame) if frame else ("date", str(getattr(ds, "AcquisitionDate", "")
+                                                        or getattr(ds, "SeriesDate", "") or "")),
+           rows, int(getattr(ds, "Columns", 0) or 0), _rounded(spacing), nFrames,
+           int(getattr(rotation, "NumberOfFramesInRotation", 0) or 0) if rotation is not None else 0,
+           _rounded([getattr(rotation, "AngularStep", 0) or 0]) if rotation is not None else (0.0,),
+           tuple(windows))
+    return {"file": filePath, "key": key, "z": float(centreZ), "fov": rows * spacing[0],
+            "series": str(getattr(ds, "SeriesInstanceUID", "") or ""),
+            "seriesNumber": str(getattr(ds, "SeriesNumber", "") or ""),
+            "description": str(getattr(ds, "SeriesDescription", "") or "")}
+
+
+def findBeds(nmFile, candidateFiles, infoCache=None):
+    """The bed positions of nmFile's multi-bed acquisition among candidateFiles (other NM files of the
+    study): same study, frame of reference, matrix, views and energy windows, at other table heights.
+    Files at the same height as a kept bed (a repeat, e.g. another time point) are left out, nmFile
+    winning; the beds kept are the contiguous chain through nmFile whose neighbours are at most
+    BED_MAX_STEP_FRACTION of the axial field of view apart. Returns the files ordered from the most
+    inferior bed to the most superior, or [nmFile] when there is no other bed."""
+    cache = infoCache if infoCache is not None else {}
+
+    def info(path):
+        if path not in cache:
+            cache[path] = bedInfo(path)
+        return cache[path]
+
+    reference = info(nmFile)
+    if reference is None:
+        return [nmFile]
+    fov = reference["fov"]
+    others = []
+    for path in candidateFiles:
+        if path == nmFile:
+            continue
+        other = info(path)
+        if other is not None and other["key"] == reference["key"] and other["series"] != reference["series"]:
+            others.append(other)
+    kept = [reference]
+    for other in sorted(others, key=lambda b: (abs(b["z"] - reference["z"]), b["seriesNumber"], b["file"])):
+        if all(abs(other["z"] - bed["z"]) >= BED_DUPLICATE_FRACTION * fov for bed in kept):
+            kept.append(other)
+    kept.sort(key=lambda b: b["z"])
+    index = kept.index(reference)
+    low = high = index
+    while low > 0 and kept[low]["z"] - kept[low - 1]["z"] <= BED_MAX_STEP_FRACTION * fov:
+        low -= 1
+    while high < len(kept) - 1 and kept[high + 1]["z"] - kept[high]["z"] <= BED_MAX_STEP_FRACTION * fov:
+        high += 1
+    return [bed["file"] for bed in kept[low:high + 1]]

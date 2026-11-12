@@ -32,6 +32,11 @@ does not depend on how many detectors acquired at once - many exports store a du
 acquisition as one merged detector) and CF the calibration factor in cps/MBq.
 Gates stay in acquisition counts.
 
+Multi-bed studies: the other bed positions of the selected SPECT are looked up in the whole study (same
+frame of reference, matrix, views and energy windows, other table height; nmdata.findBeds) and one more
+loadable is offered, selected by default: every bed reconstructed with the same settings, brought to the
+reference bed's counting time and decay, and stitched into one volume (linear blend over the overlaps).
+
 Layout: this file registers the module and the DICOM plugin; SPECTCalibration.py is the
 calibration module; the work is done in the DICOMSpectReconLib package (see its __init__.py).
 
@@ -62,6 +67,12 @@ from DICOMSpectReconLib.reconstruction import (PYTOMOGRAPHY_MIN_MAJOR, PYTOMOGRA
 
 # NM projection file -> (CT file list, how it was matched), filled in during examine()
 _CT_FOR_NM_FILE = {}
+# Multi-bed: header facts of NM files (nmdata.bedInfo), the beds found for each NM file, the single-bed
+# files that are already part of a multi-bed loadable of the same selection, and the groups loaded
+_BED_INFO = {}
+_BEDS_FOR_NM_FILE = {}
+_COVERED_BY_MULTIBED = {}
+_LOADED_MULTIBED = set()
 
 
 def showAndCenterVolume(volumeNodeID, ctNodeID=None):
@@ -177,7 +188,79 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
         loadables = []
         for files in fileLists:
             loadables += self.examineFiles(files, ctSeries)
-        return loadables
+        return self.addMultiBedLoadables(loadables)
+
+    def nmFilesInStudy(self, nmFile):
+        """Every SPECT projection file of nmFile's study in the DICOM database."""
+        db = slicer.dicomDatabase
+        found = []
+        try:
+            studyUID = db.fileValue(nmFile, self.tags["studyInstanceUID"]) or ""
+            if not studyUID:
+                return found
+            for seriesUID in db.seriesForStudy(studyUID):
+                files = list(db.filesForSeries(seriesUID))
+                if not files or (db.fileValue(files[0], self.tags["modality"]) or "").strip().upper() != "NM":
+                    continue
+                found += [f for f in files if self.isSpectProjectionFile(f)]
+        except Exception:
+            logging.warning("Could not query the DICOM database for other beds:\n" + traceback.format_exc())
+        return found
+
+    def bedsFor(self, nmFile):
+        """The beds of nmFile's multi-bed acquisition, inferior first, or [nmFile]."""
+        from DICOMSpectReconLib.nmdata import findBeds
+        try:
+            candidates = self.nmFilesInStudy(nmFile)
+            return findBeds(nmFile, candidates, _BED_INFO) if len(candidates) > 1 else [nmFile]
+        except Exception:
+            logging.warning("Could not look for other beds:\n" + traceback.format_exc())
+            return [nmFile]
+
+    def addMultiBedLoadables(self, loadables):
+        """One stitched loadable per multi-bed group (also when several of its beds are selected), placed
+        first and selected; it is grouped with its reference bed's series, whose single-bed loadable the
+        DICOM browser then leaves unselected. The other selected beds keep their single loadables; if
+        the stitched volume is loaded they are skipped (see load)."""
+        _COVERED_BY_MULTIBED.clear()
+        _LOADED_MULTIBED.clear()
+        multi, seen = [], set()
+        for loadable in loadables:
+            reference = loadable.files[0]
+            beds = _BEDS_FOR_NM_FILE.get(reference) or [reference]
+            if len(beds) < 2:
+                continue
+            group = frozenset(beds)
+            if group in seen:
+                _COVERED_BY_MULTIBED[reference] = group
+                continue
+            seen.add(group)
+            files = [reference] + [f for f in beds if f != reference]
+            db = slicer.dicomDatabase
+            desc = db.fileValue(reference, self.tags["seriesDescription"]) or "SPECT"
+            bedLabels = []
+            for f in beds:
+                number = db.fileValue(f, self.tags["seriesNumber"]) or ""
+                text = db.fileValue(f, self.tags["seriesDescription"]) or os.path.basename(f)
+                bedLabels.append(f"{('#' + number + ' ') if number else ''}{text}")
+            stitched = DICOMLoadable()
+            stitched.files = files
+            stitched.name = f"{desc} {len(beds)} beds stitched OSEM"
+            stitched.tooltip = (f"Multi-bed SPECT: {len(beds)} bed positions (inferior first: "
+                                + "; ".join(bedLabels) + ") reconstructed with the same settings and stitched "
+                                "into one volume. Timing and quantification follow the reference bed "
+                                f"({bedLabels[beds.index(reference)]}).")
+            candidates = _CT_FOR_NM_FILE.get(reference) or []
+            if candidates:
+                stitched.tooltip += f"\nCT for attenuation correction: best match {candidates[0]['label']}"
+            stitched.selected = True
+            stitched.confidence = 1.06   # above the single-bed loadable of the same series
+            multi.append(stitched)
+            loadable.tooltip += f"\nBed of a {len(beds)}-bed study - the stitched loadable reconstructs all beds."
+        for loadable in loadables:
+            if loadable.files[0] in _COVERED_BY_MULTIBED:
+                loadable.tooltip += "\nAlso in the stitched multi-bed volume; skipped when that one is loaded."
+        return multi + loadables
 
     def isSpectProjectionFile(self, filePath):
         db = slicer.dicomDatabase
@@ -256,6 +339,7 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
             candidates = self.ctCandidates(f, ctSeries or [])
             # Keep the pairing outside the loadable: Qt-wrapped loadables can lose Python attributes
             _CT_FOR_NM_FILE[f] = candidates
+            _BEDS_FOR_NM_FILE[f] = self.bedsFor(f)
 
             loadable = DICOMLoadable()
             loadable.files = [f]
@@ -283,15 +367,24 @@ class DICOMSpectReconPluginClass(DICOMPlugin):
         _reloadLibInDeveloperMode()
         from DICOMSpectReconLib.dialog import SpectReconDialog
 
-        ctCandidates = _CT_FOR_NM_FILE.get(loadable.files[0])
+        files = list(loadable.files)
+        group = _COVERED_BY_MULTIBED.get(files[0]) if len(files) == 1 else None
+        if group is not None and group in _LOADED_MULTIBED:
+            logging.info(f"SPECT recon plugin: {os.path.basename(files[0])} is already in the stitched "
+                         "multi-bed volume - not loaded again on its own.")
+            return None
+        ctCandidates = _CT_FOR_NM_FILE.get(files[0])
         if not ctCandidates:
             # examine() may not have re-run (the browser caches loadables), so look again now
-            ctCandidates = self.ctCandidates(loadable.files[0], [])
-        dialog = SpectReconDialog(loadable.files[0], loadable.name, ctCandidates)
+            ctCandidates = self.ctCandidates(files[0], [])
+        dialog = SpectReconDialog(files[0], loadable.name, ctCandidates,
+                                  bedFiles=files if len(files) > 1 else None)
         image, info = dialog.run()
         if image is None:
             logging.info("SPECT reconstruction cancelled by user.")
             return None
+        if len(files) > 1:
+            _LOADED_MULTIBED.add(frozenset(files))
 
         import sitkUtils
         suffix = "AC" if info.get("AttenuationCorrection") == "CT" else "NC"

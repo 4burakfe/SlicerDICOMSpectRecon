@@ -14,7 +14,7 @@ from .nmdata import (adjacentScatterWindows, cleanCtFiles, defaultPeakIndex, des
                      readAcquisitionInfo, readGatingInfo, readNmInfo, scatterWindowProblem)
 from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, ALGORITHM_OSEM, ALGORITHMS, FBP_WINDOWS,
                              FBP_WINDOWS_WITH_ORDER, ITERATIVE_ALGORITHMS, bsremDescription,
-                             SCALING_MODES, SCALING_VIEWS, ReconstructionAborted, SpectReconLogic,
+                             SCALING_MODES, SCALING_VIEWS, MultiBedLogic, ReconstructionAborted, SpectReconLogic,
                              applyFilter, autoScatterWeight, cutoffFraction, fbpDescription, filterDescription,
                              pytomographyVersion, scaleCounts, scatterDescription)
 from . import collimators
@@ -286,8 +286,13 @@ class SpectReconDialog:
     MAX_VIEW_SIZE = 460
     SIDE_PANEL_WIDTH = 550
 
-    def __init__(self, inputDcm, title, ctCandidates=None):
+    def __init__(self, inputDcm, title, ctCandidates=None, bedFiles=None):
         self.inputDcm = inputDcm
+        # Multi-bed study: every bed file, the reference bed (inputDcm, whose header gives the timing
+        # and quantification) first. The preview shows the reference bed's projections only.
+        self.bedFiles = list(bedFiles) if bedFiles and len(bedFiles) > 1 else None
+        if self.bedFiles and self.bedFiles[0] != inputDcm:
+            self.bedFiles = [inputDcm] + [f for f in self.bedFiles if f != inputDcm]
         self.ctCandidates = list(ctCandidates or [])
         self.ctFiles = self.ctCandidates[0]["files"] if self.ctCandidates else None
         self.ctMatchType = self.ctCandidates[0]["match"] if self.ctCandidates else ""
@@ -345,6 +350,8 @@ class SpectReconDialog:
         self.gateNumbers = nmInfo["gateNumbers"]
         self.headerWarnings = nmInfo["warnings"]
         self.nGates = nmInfo["nGates"]
+        if self.bedFiles and self.nGates > 1:
+            self.bedFiles = None  # gated studies are reconstructed bed by bed
         self.isGated = self.nGates > 1
 
         # Camera, isotope, timing and patient data for quantification / SUV
@@ -1699,23 +1706,35 @@ class SpectReconDialog:
     def _reconSliceForRow(self, row):
         """Reconstruction slice at a projection row. Whether slice 0 is the top or the bottom row is
         found once per reconstruction by matching the axial count profiles."""
-        nz = self.reconArray.shape[0]
+        first, nz = self._referenceSlices()
         rows = self.sinoStack.shape[1] if self.sinoStack is not None else nz
         if self._reconFlipped is None:
             self._reconFlipped = False
             if self.sinoStack is not None and nz > 1:
                 proj = np.interp((np.arange(nz) + 0.5) * rows / nz - 0.5, np.arange(rows),
                                  self.sinoStack.sum(axis=(0, 2)))
-                recon = self.reconArray.sum(axis=(1, 2)).astype(np.float64)
+                recon = self.reconArray[first:first + nz].sum(axis=(1, 2)).astype(np.float64)
                 proj, recon = proj - proj.mean(), recon - recon.mean()
                 self._reconFlipped = float(np.dot(proj[::-1], recon)) > float(np.dot(proj, recon))
         z = int(min(nz - 1, max(0, (row + 0.5) * nz / rows)))
-        return nz - 1 - z if self._reconFlipped else z
+        return first + (nz - 1 - z if self._reconFlipped else z)
+
+    def _referenceSlices(self):
+        """(first slice, number of slices) of the image the preview projections show: the whole image,
+        or for a multi-bed study the reference bed's part of the stitched image."""
+        total = self.reconArray.shape[0]
+        reference = getattr(self.logic, "referenceSlices", None) if self.bedFiles else None
+        if reference and 0 <= reference[0] and reference[0] + reference[1] <= total:
+            return int(reference[0]), int(reference[1])
+        return 0, total
 
     def _rowForSlice(self, index):
-        """Projection row at a reconstruction slice (inverse of _reconSliceForRow)."""
-        nz, rows = self.reconArray.shape[0], self.sinoStack.shape[1]
+        """Projection row at a reconstruction slice (inverse of _reconSliceForRow); a slice outside the
+        reference bed is clamped to its nearest row."""
+        first, nz = self._referenceSlices()
+        rows = self.sinoStack.shape[1]
         self._reconSliceForRow(0)  # sets the slice order
+        index = int(min(nz - 1, max(0, index - first)))
         z = nz - 1 - index if self._reconFlipped else index
         return int(min(rows - 1, max(0, (z + 0.5) * rows / nz)))
 
@@ -2226,7 +2245,7 @@ class SpectReconDialog:
         # The CT and photopeak must not change underneath a running reconstruction
         for widget in (self.ctCombo, self.ctBrowseButton, self.peakCombo, self.saveDefaultsButton,
                        self.restoreDefaultsButton, self.factoryDefaultsButton, self.motionButton):
-            widget.setEnabled(not busy)
+            widget.setEnabled(not busy and not (widget is self.motionButton and self.bedFiles))
         for widget in (self.quantGroup, self.suvGroup):
             widget.setEnabled(not busy and (widget is not self.suvGroup or self.quantGroup.checked))
         self._updateLockedWidgets()
@@ -2290,6 +2309,16 @@ class SpectReconDialog:
                 self.log(f"WARNING: {warning}")
             for warning in self.headerWarnings:
                 self.log(f"WARNING: {warning}")
+            if self.bedFiles:
+                self.log(f"Multi-bed study: {len(self.bedFiles)} beds, reconstructed with the same settings and "
+                         "stitched into one volume. Reference bed (timing, quantification, preview projections): "
+                         f"{os.path.basename(self.bedFiles[0])}.")
+                for path in self.bedFiles[1:]:
+                    self.log(f"  - other bed: {os.path.basename(path)}")
+                self.log("Motion correction is not available for multi-bed studies; the projection preview "
+                         "shows the reference bed only.")
+                self.motionButton.setEnabled(False)
+                self.motionButton.setToolTip("Not available for multi-bed studies")
             if self.isGated:
                 self.log(f"Gated acquisition: {self.nGates} gates ({self.gateNumbers}). "
                          "The static image is reconstructed from the summed gate counts.")
@@ -2384,9 +2413,13 @@ class SpectReconDialog:
                 self.gateRawImages = []
                 self.gateRawStats = []
                 self.gateReconKey = None
-                self.logic = SpectReconLogic(self.inputDcm, self.log, self.ctFiles, params["indexPeak"],
-                                             motion=self.motion, progress=self._progress,
-                                             shouldAbort=lambda: self.abortRequested)
+                if self.bedFiles:
+                    self.logic = MultiBedLogic(self.bedFiles, self.log, self.ctFiles, params["indexPeak"],
+                                               progress=self._progress, shouldAbort=lambda: self.abortRequested)
+                else:
+                    self.logic = SpectReconLogic(self.inputDcm, self.log, self.ctFiles, params["indexPeak"],
+                                                 motion=self.motion, progress=self._progress,
+                                                 shouldAbort=lambda: self.abortRequested)
             if self.logic.ctFiles != self.ctFiles:
                 self.logic.ctFiles = self.ctFiles
                 self.logic.attenuationMap = None
@@ -2450,6 +2483,13 @@ class SpectReconDialog:
             self.info.update(quantInfo)
             if params["attenuationCorrection"]:
                 self.info["CTMatch"] = self.ctMatchType
+            if self.bedFiles:
+                self.info["Beds"] = len(self.bedFiles)
+                self.info["BedFiles"] = json.dumps(self.bedFiles)
+                self.info["BedTimingFactors"] = json.dumps(
+                    [round(float(b["factor"]), 6) for b in getattr(self.logic, "bedNotes", [])])
+                self.info["BedStitching"] = ("linear blend over the overlap, edge slices left out; counts of every "
+                                             "bed brought to the reference bed's counting time and time point")
             if self.isGated:
                 self.info["StaticFrom"] = f"sum of {self.nGates} gates"
                 self.info["GateNumbers"] = json.dumps([int(g) for g in self.gateNumbers])
