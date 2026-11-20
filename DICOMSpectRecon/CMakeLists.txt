@@ -17,6 +17,7 @@ set(MODULE_PYTHON_SCRIPTS
 
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
+  Resources/Images/logo.png
   )
 
 slicerMacroBuildScriptedModule(
