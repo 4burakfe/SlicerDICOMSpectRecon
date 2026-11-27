@@ -11,6 +11,7 @@ import tempfile
 import numpy as np
 
 from .nmdata import prepareProjectionFile, readNmInfo, writeGateFile, writeSummedGatesFile
+from .lowmemory import MEMORY_AUTO, MEMORY_MODES
 
 
 # Output count scaling modes (see module docstring)
@@ -264,6 +265,9 @@ class SpectReconLogic:
         self.progress = progress
         self.shouldAbort = shouldAbort
         self.attenuationMap = None
+        # GPU memory use (lowmemory.MEMORY_MODES): Automatic moves to axial slabs or the CPU when the GPU is too small
+        self.memoryMode = MEMORY_AUTO
+        self.lastMemoryPlan = None
         self.tempDir = tempfile.mkdtemp(prefix="spect_gates_")
         self.gateSets = {}
 
@@ -416,12 +420,8 @@ class SpectReconLogic:
         for resolution recovery (collimator-detector response in the system matrix).
         fbp (FBP only): {"window", "cutoff" (cycles/cm), "order"}. FBP subtracts the scatter estimate
         from the projections and corrects attenuation with the first order Chang method.
-        Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts()."""
-        import torch
-        from pytomography.projectors.SPECT import SPECTSystemMatrix
-        from pytomography.likelihoods import PoissonLogLikelihood
-        from pytomography.algorithms import OSEM
-
+        Returns (SimpleITK float image, stats); count scaling is applied later with scaleCounts().
+        Where it runs (whole object on the GPU, axial slabs, or the CPU) follows self.memoryMode."""
         projectionSet = projectionSet or self.staticSet
         nViews = projectionSet.nViews
         if algorithm not in ALGORITHMS:
@@ -436,10 +436,7 @@ class SpectReconLogic:
         elif not fbp or fbp.get("window") not in FBP_WINDOWS:
             raise ValueError("FBP needs a filter window (" + ", ".join(FBP_WINDOWS) + ").")
 
-        obj2obj_transforms = []
-        if useAttenuationCorrection:
-            from pytomography.transforms.SPECT import SPECTAttenuationTransform
-            obj2obj_transforms.append(SPECTAttenuationTransform(self.getAttenuationMap()))
+        psfFactory = None
         if psf is not None:
             if algorithm == ALGORITHM_FBP:
                 self.log("  -> Resolution recovery is not used with FBP (iterative algorithms only).")
@@ -447,7 +444,70 @@ class SpectReconLogic:
                 from . import collimators
                 entry, energyKeV = psf["entry"], float(psf["energyKeV"])
                 self.log(f"Resolution recovery: {collimators.describe(entry, energyKeV)}")
-                obj2obj_transforms.append(collimators.psfTransform(entry, energyKeV))
+                psfFactory = lambda: collimators.psfTransform(entry, energyKeV)
+        attenuationMap = self.getAttenuationMap() if useAttenuationCorrection else None
+        plan = self.memoryPlan(projectionSet, subsets, algorithm, attenuationMap is not None, psfFactory)
+        self.lastMemoryPlan = plan
+        self.log(f"Compute: {plan.describe()}")
+        from .lowmemory import useDevice, releaseGpuCaches
+        if plan.lowMemory:
+            releaseGpuCaches()  # the rotation transposes a whole-object run left on the GPU
+        with useDevice("cpu" if plan.device == "cpu" else None):
+            try:
+                return self._reconstructOn(plan, projectionSet, iters, subsets, attenuationMap, psfFactory,
+                                           scatter, algorithm, fbp, bsrem, useAttenuationCorrection, psf)
+            finally:
+                if plan.lowMemory or plan.device == "cpu":
+                    releaseGpuCaches()
+
+    def memoryPlan(self, projectionSet, subsets, algorithm, attenuation, psfFactory):
+        """lowmemory.MemoryPlan for this reconstruction, from the memory mode and the GPU memory free now."""
+        from . import lowmemory
+        halo = 0
+        if psfFactory is not None:
+            probe = psfFactory()
+            probe.configure(projectionSet.object_meta, projectionSet.proj_meta)
+            halo = lowmemory.psfHalo(probe)
+        iterative = algorithm in ITERATIVE_ALGORITHMS
+        return lowmemory.planMemory(self.memoryMode, tuple(projectionSet.object_meta.shape), projectionSet.nViews,
+                                    tuple(projectionSet.projections.shape), subsets if iterative else 1,
+                                    attenuation=attenuation, psf=psfFactory is not None and iterative, halo=halo,
+                                    bsrem=algorithm == ALGORITHM_BSREM)
+
+    def _systemMatrix(self, plan, projectionSet, attenuationMap, psfFactory):
+        """The SPECT system matrix: PyTomography's, or the same computed on axial slabs (lowmemory)."""
+        from pytomography.projectors.SPECT import SPECTSystemMatrix
+        if plan.lowMemory:
+            from .lowmemory import makeSlabSystemMatrix
+            return makeSlabSystemMatrix(projectionSet.object_meta, projectionSet.proj_meta, attenuationMap,
+                                        psfFactory, slabs=plan.slabs, hostNorms=plan.hostNorms,
+                                        hostTransposes=plan.hostTransposes, log=self.log)
+        obj2obj_transforms = []
+        if attenuationMap is not None:
+            from pytomography.transforms.SPECT import SPECTAttenuationTransform
+            obj2obj_transforms.append(SPECTAttenuationTransform(attenuationMap))
+        if psfFactory is not None:
+            obj2obj_transforms.append(psfFactory())
+        return SPECTSystemMatrix(obj2obj_transforms=obj2obj_transforms, proj2proj_transforms=[],
+                                 object_meta=projectionSet.object_meta, proj_meta=projectionSet.proj_meta)
+
+    def _likelihood(self, plan, system_matrix, projections, additive_term):
+        from pytomography.likelihoods import PoissonLogLikelihood
+        if plan.lowMemory:
+            from .lowmemory import hostNormLikelihood
+            return hostNormLikelihood(system_matrix, projections, additive_term=additive_term)
+        return PoissonLogLikelihood(system_matrix, projections, additive_term=additive_term)
+
+    def _reconstructOn(self, plan, projectionSet, iters, subsets, attenuationMap, psfFactory, scatter,
+                       algorithm, fbp, bsrem, useAttenuationCorrection, psf):
+        import torch
+        from pytomography.algorithms import OSEM
+        nViews = projectionSet.nViews
+        projections = projectionSet.projections
+        if plan.device == "cpu":
+            projections = projections.cpu()
+            if attenuationMap is not None:
+                attenuationMap = attenuationMap.cpu()
 
         photopeakCounts = float(projectionSet.projections.sum().item())
         additive_term = None
@@ -460,6 +520,8 @@ class SpectReconLogic:
             weightNote = "" if weight is None else f", weight {float(weight):g} x lower window"
             self.log(f"Estimating scatter ({method} energy window{weightNote}) for {projectionSet.label}...")
             additive_term = projectionSet.scatterEstimate(self.indexPeak, indexLower, indexUpper, weight)
+            if plan.device == "cpu":
+                additive_term = additive_term.cpu()
             if not bool(torch.isfinite(additive_term).all()):
                 raise ValueError("The scatter estimate contains invalid values - check the energy windows.")
             scatterCounts = float(additive_term.sum().item())
@@ -477,26 +539,20 @@ class SpectReconLogic:
                                                  and algorithm != ALGORITHM_FBP)) if used]
         self.log("Building System Matrix"
                  + (f" (with {' and '.join(corrections)})..." if corrections else "..."))
-        system_matrix = SPECTSystemMatrix(
-            obj2obj_transforms=obj2obj_transforms,
-            proj2proj_transforms=[],
-            object_meta=projectionSet.object_meta,
-            proj_meta=projectionSet.proj_meta
-        )
+        system_matrix = self._systemMatrix(plan, projectionSet, attenuationMap, psfFactory)
 
         # 3. Reconstruction
         if algorithm == ALGORITHM_FBP:
-            reconstructed_object = self._reconstructFBP(projectionSet, system_matrix, additive_term,
-                                                        useAttenuationCorrection, fbp)
+            reconstructed_object = self._reconstructFBP(projectionSet, projections, system_matrix, additive_term,
+                                                        useAttenuationCorrection, fbp, plan)
         elif algorithm == ALGORITHM_BSREM:
-            reconstructed_object = self._reconstructBSREM(projectionSet, system_matrix, additive_term,
-                                                          iters, subsets, bsrem)
+            reconstructed_object = self._reconstructBSREM(projectionSet, projections, system_matrix, additive_term,
+                                                          iters, subsets, bsrem, plan)
         else:
             self.log(f"Running OSEM on {projectionSet.label} (Iterations: {iters}, Subsets: {subsets})...")
             if subsets > 1 and nViews % subsets != 0:
                 self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
-            likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections,
-                                              additive_term=additive_term)
+            likelihood = self._likelihood(plan, system_matrix, projections, additive_term)
             reconstruction_algorithm = OSEM(likelihood)
             monitor = _OsemMonitor(projectionSet.label, iters, subsets, self.progress, self.shouldAbort)
             reconstructed_object = reconstruction_algorithm(n_iters=iters, n_subsets=subsets, callback=monitor)
@@ -539,10 +595,9 @@ class SpectReconLogic:
         return objectToImage(reconstructed_object, projectionSet.object_meta), stats
 
 
-    def _reconstructBSREM(self, projectionSet, system_matrix, additive_term, iters, subsets, bsrem):
+    def _reconstructBSREM(self, projectionSet, projections, system_matrix, additive_term, iters, subsets, bsrem, plan):
         """BSREM with a relative difference prior, started from OSEM. The decreasing relaxation makes it
         converge, so beta (not the iteration count) sets the noise; no post-filter is needed."""
-        from pytomography.likelihoods import PoissonLogLikelihood
         from pytomography.algorithms import BSREM, OSEM
         from pytomography.priors import RelativeDifferencePrior
 
@@ -552,7 +607,7 @@ class SpectReconLogic:
                  f"relative difference prior beta {beta:g}, gamma {gamma:g})...")
         if subsets > 1 and nViews % subsets != 0:
             self.log(f"  -> Note: {nViews} views do not divide evenly into {subsets} subsets.")
-        likelihood = PoissonLogLikelihood(system_matrix, projectionSet.projections, additive_term=additive_term)
+        likelihood = self._likelihood(plan, system_matrix, projections, additive_term)
         # With resolution recovery convergence is slower: the decreasing relaxation would stop the image
         # before the PSF has sharpened it, so the start and the relaxation are stretched by the RR factor.
         scale = max(1, int(bsrem.get("rrScale", 1) or 1))
@@ -572,11 +627,11 @@ class SpectReconLogic:
         self.log("BSREM reconstruction complete.")
         return image
 
-    def _reconstructFBP(self, projectionSet, system_matrix, additive_term, useAttenuationCorrection, fbp):
+    def _reconstructFBP(self, projectionSet, projections, system_matrix, additive_term, useAttenuationCorrection,
+                        fbp, plan):
         """Filtered backprojection of one projection set; negative voxels are set to 0 (the image is
         stored as unsigned DICOM, and negative counts have no meaning for the display or the VOIs)."""
         import torch
-        from pytomography.projectors.SPECT import SPECTSystemMatrix
 
         window, cutoffCm, order = fbp["window"], float(fbp.get("cutoff", 1.0)), int(fbp.get("order", 10))
         pixelR, pixelZ = (float(d) for d in projectionSet.proj_meta.dr[:2])  # mm
@@ -592,20 +647,17 @@ class SpectReconLogic:
         if self.shouldAbort is not None and self.shouldAbort():
             raise ReconstructionAborted()
 
-        projections = projectionSet.projections
         if additive_term is not None:
             # FBP has no noise model: subtract the scatter estimate from the data
             projections = torch.clamp(projections - additive_term, min=0)
         geometric = system_matrix
         if useAttenuationCorrection:
-            geometric = SPECTSystemMatrix(obj2obj_transforms=[], proj2proj_transforms=[],
-                                          object_meta=projectionSet.object_meta,
-                                          proj_meta=projectionSet.proj_meta)
+            geometric = self._systemMatrix(plan, projectionSet, None, None)
         with torch.no_grad():
             image = filteredBackProjection(projections, geometric, window, fraction, order, pixelR, pixelZ)
             if useAttenuationCorrection:
                 self.log("  -> Chang (first order) attenuation correction from the CT attenuation map")
-                image = image * changCorrection(system_matrix, geometric)
+                image = image * changCorrection(system_matrix, geometric).to(image.device)
         negative = float(-image[image < 0].sum().item())
         positive = float(image[image > 0].sum().item())
         image = torch.clamp(image, min=0)
@@ -949,6 +1001,19 @@ class MultiBedLogic:
     @property
     def attenuationMap(self):
         return self.beds[0].attenuationMap if self.beds else None
+
+    @property
+    def memoryMode(self):
+        return self.beds[0].memoryMode if self.beds else MEMORY_AUTO
+
+    @memoryMode.setter
+    def memoryMode(self, mode):
+        for bed in self.beds:
+            bed.memoryMode = mode
+
+    @property
+    def lastMemoryPlan(self):
+        return self.beds[-1].lastMemoryPlan if self.beds else None
 
     @attenuationMap.setter
     def attenuationMap(self, value):

@@ -7,6 +7,7 @@ set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}Lib/__init__.py
   ${MODULE_NAME}Lib/nmdata.py
   ${MODULE_NAME}Lib/reconstruction.py
+  ${MODULE_NAME}Lib/lowmemory.py
   ${MODULE_NAME}Lib/quantification.py
   ${MODULE_NAME}Lib/collimators.py
   ${MODULE_NAME}Lib/motion.py
