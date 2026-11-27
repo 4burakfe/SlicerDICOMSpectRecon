@@ -63,13 +63,15 @@ def peak(fn):
     return out, time.time() - t, (torch.cuda.max_memory_reserved() / 1e9 if cuda else float("nan"))
 
 
-whole = SPECTSystemMatrix([SPECTAttenuationTransform(mu), psfFactory()], [], om, pm)
+# the data are made with thin slabs, so that making them fits on any GPU
+maker = LM.makeSlabSystemMatrix(om, pm, mu, psfFactory, slabs=32, hostNorms=True, hostTransposes=True)
 with torch.no_grad():
-    clean = whole.forward(truth)
+    clean = maker.forward(truth).cpu()
+del maker, truth
 scale = 2e7 / float(clean.sum())
-projections = torch.poisson((clean * scale).cpu(), generator=g).to(pytomography.device)
+projections = torch.poisson(clean * scale, generator=g).to(pytomography.device)
 scatter = torch.full_like(projections, 0.2 * float(projections.mean()))
-del whole, clean
+del clean
 LM.releaseGpuCaches()
 print(f"Projections {tuple(projections.shape)}, {float(projections.sum()):.3g} counts; OSEM {ITERS} x {SUBSETS}")
 
