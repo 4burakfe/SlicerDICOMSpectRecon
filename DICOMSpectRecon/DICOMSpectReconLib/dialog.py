@@ -17,6 +17,7 @@ from .reconstruction import (ALGORITHM_BSREM, ALGORITHM_FBP, ALGORITHM_OSEM, ALG
                              SCALING_MODES, SCALING_VIEWS, MultiBedLogic, ReconstructionAborted, SpectReconLogic,
                              applyFilter, autoScatterWeight, cutoffFraction, fbpDescription, filterDescription,
                              pytomographyVersion, scaleCounts, scatterDescription)
+from .lowmemory import MEMORY_AUTO, MEMORY_MODES
 from . import collimators
 from . import display
 from . import motion
@@ -659,6 +660,17 @@ class SpectReconDialog:
         self.rrBsremFactorSpin.setToolTip(
             "BSREM iterations are multiplied by this while resolution recovery is on (BSREM converges, but "
             "more slowly with the PSF in the model). The iteration box itself is not changed.")
+        self.memoryCombo = _compactCombo()
+        self.memoryCombo.addItems(MEMORY_MODES)
+        self.memoryCombo.setCurrentIndex(MEMORY_MODES.index(MEMORY_AUTO))
+        self.memoryCombo.setToolTip(
+            "Where the reconstruction runs. The images are the same in every mode (to float rounding).\n"
+            "Automatic: the whole object on the GPU when it fits in the GPU memory free; otherwise the projector "
+            "runs on axial slabs, with its caches in RAM, and on the CPU when even thin slabs do not fit "
+            "(e.g. 256 x 256 studies on a 2 GB laptop GPU).\n"
+            "GPU, full speed: always the whole object (on a GPU that is too small Windows then spills into "
+            "system memory, which is very slow).\n"
+            "GPU, low memory: always slabs. CPU: no GPU (slow).")
         self._loadCollimators()
         self.reconRows = {}
         for row, (key, label, widget) in enumerate([
@@ -670,12 +682,13 @@ class SpectReconDialog:
                 ("fbp", "", self.fbpCutoffNyquistLabel), ("fbpOrder", "Order:", self.fbpOrderSpin),
                 ("rr", "", self.rrCheckBox), ("rr", "Collimator:", self.rrCombo), ("rr", "", self.rrNote),
                 ("rrOsem", "RR iterations:", self.rrOsemFactorSpin),
-                ("rrBsrem", "RR iterations:", self.rrBsremFactorSpin)]):
+                ("rrBsrem", "RR iterations:", self.rrBsremFactorSpin),
+                ("memory", "GPU memory:", self.memoryCombo)]):
             labelWidget = qt.QLabel(label)
             reconForm.addWidget(labelWidget, row, 0)
             reconForm.addWidget(widget, row, 1)
             self.reconRows.setdefault(key, []).extend([labelWidget, widget])
-        reconForm.setRowStretch(15, 1)
+        reconForm.setRowStretch(16, 1)
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateRrNote())
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._updateAlgorithmRows())
         self.rrCheckBox.connect("toggled(bool)", lambda checked: self._applyRrFilters())
@@ -950,7 +963,8 @@ class SpectReconDialog:
                    ("order", self.orderSpin), ("collimator", self.rrCombo), ("rrOsemFactor", self.rrOsemFactorSpin),
                    ("rrBsremFactor", self.rrBsremFactorSpin), ("scaling", self.scalingCombo),
                    ("attenuationCorrection", self.acCheckBox), ("showOnCt", self.showOnCtCheckBox),
-                   ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin)]
+                   ("scatter", self.scatterCheckBox), ("scatterWeight", self.scatterWeightSpin),
+                   ("memoryMode", self.memoryCombo)]
         if self.isGated:
             widgets += [("gated", self.gatedEnableCheckBox), ("gatedIters", self.gatedItersSpin),
                         ("gatedSubsets", self.gatedSubsetsSpin), ("gatedBeta", self.gatedBetaSpin),
@@ -2423,6 +2437,8 @@ class SpectReconDialog:
             if self.logic.ctFiles != self.ctFiles:
                 self.logic.ctFiles = self.ctFiles
                 self.logic.attenuationMap = None
+            # not part of the reconstruction key: every mode gives the same image
+            self.logic.memoryMode = self.memoryCombo.currentText
             params = self._validate(params)
 
             scatter = self.scatterArgument(params)
@@ -2465,6 +2481,8 @@ class SpectReconDialog:
                 "ScatterCounts": f"{stats['scatterCounts']:.0f}",
                 "DataConsistency": "n/a" if stats["consistency"] is None else f"{stats['consistency']:.3f}",
                 "PyTomographyVersion": pytomographyVersion(),
+                "Compute": self.logic.lastMemoryPlan.describe() if getattr(self.logic, "lastMemoryPlan", None)
+                           else "n/a",
                 "SourceFile": self.inputDcm,
                 "Units": units,
                 # Multiply voxel values by this to get acquisition counts (used by SPECT Calibration)

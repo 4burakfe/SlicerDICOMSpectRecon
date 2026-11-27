@@ -133,6 +133,16 @@ stored on every reconstructed volume; for quantitative studies, do not mix recon
 and 4.x without checking them against each other.
 A GPU makes reconstruction much faster.
 
+**Small GPUs.** A 256 x 256 study with attenuation correction and resolution recovery needs about 3.5-4 GB of
+GPU memory when the whole object is projected at once; on a smaller GPU Windows spills into system memory and
+the reconstruction crawls. The *GPU memory* setting (Reconstruction box) handles this: **Automatic** (default)
+estimates what the reconstruction needs and, when it does not fit in the GPU memory free, runs the projector
+on axial slabs (with a margin for the PSF's z blur, so the result is unchanged), keeps the H_m^T 1 images and,
+if needed, the rotation transposes in RAM, and falls back to the CPU only when even thin slabs do not fit.
+*GPU, full speed*, *GPU, low memory* and *CPU* force one way. Every mode gives the same image to float
+rounding (largest voxel difference about 1e-6 of the maximum in the test phantom); the mode used is logged and
+stored on the volume (`Compute`).
+
 ## Layout
 
 ```
@@ -144,6 +154,7 @@ DICOMSpectRecon/
   DICOMSpectReconLib/
     nmdata.py                  NM header, energy windows, gating (incl. ECG R-R / beats), CT matching
     reconstruction.py          PyTomography OSEM, BSREM and FBP, count scaling, post-filters
+    lowmemory.py               GPU memory plan, slab-by-slab projector for small GPUs
     quantification.py          calibration factors, Bq/ml, SUV, calibration library
     collimators.py             collimator library, header matching, resolution recovery PSF
     motion.py                  motion detection and projection shifts
