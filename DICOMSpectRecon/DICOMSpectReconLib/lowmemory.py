@@ -41,6 +41,15 @@ MIN_SLAB_PLANES = 4
 SLAB_COUNTS = [2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]
 # Below this many planes per slab the slabs cost more in launches than the CPU would; use the CPU instead
 CPU_BELOW_SLAB_PLANES = 4
+# Most work the slabs may take, as a multiple of the whole object's (each slab also projects its PSF margin planes:
+# at 256^3 with resolution recovery the margin is ~18 planes a side, so 64 slabs would do ~10 times the work for
+# hardly less memory than 16)
+MAX_SLAB_WORK = 4.0
+
+
+def slabWork(nz, slabs, halo):
+    """Planes the slabs project, as a multiple of nz."""
+    return sum(e1 - e0 for _, _, e0, e1 in slabRanges(nz, slabs, halo)) / float(nz)
 
 
 class MemoryPlan:
@@ -55,6 +64,7 @@ class MemoryPlan:
         self.gpuBytes = gpuBytes
         self.freeBytes = freeBytes
         self.note = note
+        self.work = None
 
     @property
     def lowMemory(self):
@@ -67,6 +77,8 @@ class MemoryPlan:
             where = "host" if self.hostTransposes else "GPU"
             text = (f"GPU, low memory: {self.slabs} axial slabs, H_m^T 1 images on the host, "
                     f"rotation transposes on the {where}")
+            if self.work and self.work > 1.05:
+                text += f", {self.work:.1f}x the projections of the whole object (PSF margins)"
         else:
             text = f"GPU ({self.device}), whole object"
         if self.gpuBytes is not None and self.freeBytes is not None:
@@ -158,6 +170,15 @@ def freeGpuBytes(device=None):
 
 def planMemory(mode, objectShape, nViews, projShape, nSubsets, attenuation=False, psf=False, halo=0, bsrem=False,
                gpuDevice=None, freeBytes=None):
+    plan = _planMemory(mode, objectShape, nViews, projShape, nSubsets, attenuation, psf, halo, bsrem, gpuDevice,
+                       freeBytes)
+    if plan.slabs:
+        plan.work = slabWork(int(objectShape[2]), plan.slabs, halo)
+    return plan
+
+
+def _planMemory(mode, objectShape, nViews, projShape, nSubsets, attenuation=False, psf=False, halo=0, bsrem=False,
+                gpuDevice=None, freeBytes=None):
     """MemoryPlan for the memory mode (MEMORY_MODES). Automatic: the whole object on the GPU when it fits in the memory
     free now, else the fewest slabs that fit (rotation transposes on the GPU if they still fit, else on the host), else
     the CPU. 'GPU, low memory' always uses slabs (as many as needed, at least 4). freeBytes overrides the free memory
@@ -190,16 +211,21 @@ def planMemory(mode, objectShape, nViews, projShape, nSubsets, attenuation=False
     if mode != MEMORY_LOW and (budget is None or whole <= budget):
         return MemoryPlan(gpuDevice, gpuBytes=whole, freeBytes=freeBytes)
     Lz = int(objectShape[2])
-    counts = [s for s in SLAB_COUNTS if (mode != MEMORY_LOW or s >= 4) and Lz // s >= CPU_BELOW_SLAB_PLANES] or [1]
+    counts = [s for s in SLAB_COUNTS if (mode != MEMORY_LOW or s >= 4) and Lz // s >= CPU_BELOW_SLAB_PLANES]
+    counts = [s for s in counts if slabWork(Lz, s, halo) <= MAX_SLAB_WORK] or counts[:1] or [1]
     for hostTransposes in (False, True):
         for slabs in counts:
             need = estimateGpuBytes(**args, slabs=slabs, hostNorms=True, hostTransposes=hostTransposes)
             if budget is None or need <= budget:
                 return MemoryPlan(gpuDevice, slabs=slabs, hostNorms=True, hostTransposes=hostTransposes,
                                   gpuBytes=need, freeBytes=freeBytes)
-    # Nothing fits the budget. The thinnest slabs still go on the GPU while they fit in the memory free (without the
-    # reserve; a little over it, Windows spills into system memory, slower but still faster than the CPU)
+    # Nothing fits the budget. The fewest slabs that fit in the memory free (without the reserve; a little over it,
+    # Windows spills into system memory, slower but still faster than the CPU) still go on the GPU
     slabs = counts[-1]
+    for count in counts:
+        if estimateGpuBytes(**args, slabs=count, hostNorms=True, hostTransposes=True) <= freeBytes:
+            slabs = count
+            break
     need = estimateGpuBytes(**args, slabs=slabs, hostNorms=True, hostTransposes=True)
     if mode == MEMORY_LOW or need <= freeBytes:
         return MemoryPlan(gpuDevice, slabs=slabs, hostNorms=True, hostTransposes=True, gpuBytes=need,

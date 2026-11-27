@@ -4,19 +4,21 @@ the time and peak GPU memory of each run, and the largest difference between the
 
     PythonSlicer lowmemory_check.py CODE [L] [VIEWS] [SUBSETS] [ITERS] [MODES]
 
-CODE: the DICOMSpectRecon folder (holding DICOMSpectReconLib). Defaults: 256 120 8 2. MODES: comma separated,
+CODE: the DICOMSpectRecon folder (holding DICOMSpectReconLib). Defaults: 256 120 8 1. MODES: comma separated,
 from auto, whole, low, cpu (default auto,low,whole: whole last, since on a small GPU it may crawl)."""
+import functools
 import os
 import sys
 import time
 import warnings
 
 warnings.simplefilter("ignore")
+print = functools.partial(print, flush=True)
 code = sys.argv[1]
 L = int(sys.argv[2]) if len(sys.argv) > 2 else 256
 NV = int(sys.argv[3]) if len(sys.argv) > 3 else 120
 SUBSETS = int(sys.argv[4]) if len(sys.argv) > 4 else 8
-ITERS = int(sys.argv[5]) if len(sys.argv) > 5 else 2
+ITERS = int(sys.argv[5]) if len(sys.argv) > 5 else 1
 MODES = (sys.argv[6] if len(sys.argv) > 6 else "auto,low,whole").split(",")
 sys.path.insert(0, code)
 
@@ -63,8 +65,14 @@ def peak(fn):
     return out, time.time() - t, (torch.cuda.max_memory_reserved() / 1e9 if cuda else float("nan"))
 
 
-# the data are made with thin slabs, so that making them fits on any GPU
-maker = LM.makeSlabSystemMatrix(om, pm, mu, psfFactory, slabs=32, hostNorms=True, hostTransposes=True)
+# the data are made with slabs (forward projection only, the plan of 'GPU, low memory'), so that it fits on any GPU
+probe = psfFactory()
+probe.configure(om, pm)
+halo = LM.psfHalo(probe)
+makerPlan = LM.planMemory(LM.MEMORY_LOW, (L, L, L), NV, (NV, L, L), SUBSETS, True, True, halo=halo)
+print(f"Making the data: {makerPlan.describe()}")
+t0 = time.time()
+maker = LM.makeSlabSystemMatrix(om, pm, mu, psfFactory, slabs=makerPlan.slabs, hostNorms=True, hostTransposes=True)
 with torch.no_grad():
     clean = maker.forward(truth).cpu()
 del maker, truth
@@ -73,14 +81,26 @@ projections = torch.poisson(clean * scale, generator=g).to(pytomography.device)
 scatter = torch.full_like(projections, 0.2 * float(projections.mean()))
 del clean
 LM.releaseGpuCaches()
-print(f"Projections {tuple(projections.shape)}, {float(projections.sum()):.3g} counts; OSEM {ITERS} x {SUBSETS}")
-
-probe = psfFactory()
-probe.configure(om, pm)
-halo = LM.psfHalo(probe)
+print(f"Projections {tuple(projections.shape)}, {float(projections.sum()):.3g} counts (made in {time.time() - t0:.0f} s); "
+      f"OSEM {ITERS} x {SUBSETS}")
 plan = LM.planMemory(LM.MEMORY_AUTO, (L, L, L), NV, tuple(projections.shape), SUBSETS, attenuation=True, psf=True,
                      halo=halo)
 print("Automatic plan:", plan.describe())
+
+class Progress:
+    """OSEM callback: prints the time of every subset."""
+    def __init__(self):
+        self.t = time.time()
+
+    def run(self, object, n_iter=0, n_subset=0, *args, **kwargs):
+        now = time.time()
+        print(f"       iteration {n_iter + 1}, subset {n_subset + 1}/{SUBSETS}: {now - self.t:.1f} s")
+        self.t = now
+        return object
+
+    def finalize(self, *args, **kwargs):
+        return None
+
 
 images = {}
 for mode in MODES:
@@ -93,6 +113,7 @@ for mode in MODES:
     else:
         p = LM.MemoryPlan("cpu")
     LM.releaseGpuCaches()
+    print(f"{mode}: {p.describe()}")
 
     def run():
         with LM.useDevice("cpu" if p.device == "cpu" else None):
@@ -106,7 +127,7 @@ for mode in MODES:
             else:
                 sm = SPECTSystemMatrix([SPECTAttenuationTransform(amap), psfFactory()], [], om, pm)
                 likelihood = PoissonLogLikelihood(sm, proj, additive_term=add)
-            return OSEM(likelihood)(n_iters=ITERS, n_subsets=SUBSETS).cpu()
+            return OSEM(likelihood)(n_iters=ITERS, n_subsets=SUBSETS, callback=Progress()).cpu()
 
     image, seconds, gb = peak(run)
     images[mode] = image
